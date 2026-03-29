@@ -38,7 +38,7 @@ def _parse_bool(value, default: bool = False) -> bool:
     "presupposition_validation",
     "presupposition_validation_dev",
     "核查用户提问中隐藏的预设前提，防止基于虚假前提的回答",
-    "1.0.6",
+    "1.0.7",
 )
 class PresuppositionValidation(Star):
 
@@ -55,14 +55,21 @@ class PresuppositionValidation(Star):
         self._pending_tasks: set[asyncio.Task] = set()
         self._session_sent_events: dict[str, asyncio.Event] = {}
         self._sent_bot_msg_ids: dict[str, int] = {}
-        self._cache_lock = asyncio.Lock()
         self._task_semaphore = asyncio.Semaphore(self._MAX_CONCURRENT_TASKS)
+
+    @staticmethod
+    def _get_session_id(event: AstrMessageEvent) -> str:
+        if hasattr(event, "get_session_id"):
+            sid = event.get_session_id()
+            if sid:
+                return str(sid)
+        return event.unified_msg_origin
 
     # ==================================================================
     # 群组缓存 GC
     # ==================================================================
 
-    async def _gc_group_cache(self):
+    def _gc_group_cache(self):
         if len(self._group_last_active) <= 100:
             return
         now = _time.monotonic()
@@ -90,7 +97,7 @@ class PresuppositionValidation(Star):
         if not self.cfg.enabled:
             return
 
-        await self._gc_group_cache()
+        self._gc_group_cache()
 
         user_message = ""
         if hasattr(event, "message_str"):
@@ -103,7 +110,7 @@ class PresuppositionValidation(Star):
             return
 
         if self.cfg.enable_async_mode:
-            task_id = f"{getattr(event, 'get_session_id', lambda: event.unified_msg_origin)()}:{_time.time_ns()}"
+            task_id = f"{self._get_session_id(event)}:{_time.time_ns()}"
             sent_evt = asyncio.Event()
             self._session_sent_events[task_id] = sent_evt
 
@@ -128,9 +135,7 @@ class PresuppositionValidation(Star):
 
     @filter.after_message_sent()
     async def on_message_sent(self, event: AstrMessageEvent):
-        session = getattr(event, 'get_session_id', lambda: None)()
-        if not session:
-            session = event.unified_msg_origin
+        session = self._get_session_id(event)
         prefix = f"{session}:"
         for key in list(self._session_sent_events):
             if key.startswith(prefix):
@@ -799,13 +804,10 @@ class PresuppositionValidation(Star):
         self, provider, presupposition: str
     ) -> Optional[tuple]:
         try:
-            from duckduckgo_search import DDGS
+            from duckduckgo_search import AsyncDDGS
 
-            search_results = await asyncio.to_thread(
-                lambda: list(
-                    DDGS().text(presupposition, max_results=3)
-                )
-            )
+            async with AsyncDDGS() as ddgs:
+                search_results = await ddgs.text(presupposition, max_results=3)
         except ImportError:
             logger.error(
                 "[presupposition_validation] web_search 模式需要安装 "
@@ -867,48 +869,47 @@ class PresuppositionValidation(Star):
     ) -> Optional[str]:
         threshold = max(0.0, min(1.0, self.cfg.similarity_threshold))
 
-        async with self._cache_lock:
-            if len(self._group_msg_cache) >= self._MAX_GROUP_CACHE:
-                self._group_msg_cache.popitem(last=False)
+        if len(self._group_msg_cache) >= self._MAX_GROUP_CACHE:
+            self._group_msg_cache.popitem(last=False)
 
-            queue = self._group_msg_cache.get(group_id)
-            if queue is None:
-                queue = deque(maxlen=self.cfg.history_window_size)
-                self._group_msg_cache[group_id] = queue
+        queue = self._group_msg_cache.get(group_id)
+        if queue is None:
+            queue = deque(maxlen=self.cfg.history_window_size)
+            self._group_msg_cache[group_id] = queue
 
-            self._group_last_active[group_id] = _time.monotonic()
-            self._group_msg_cache.move_to_end(group_id)
+        self._group_last_active[group_id] = _time.monotonic()
+        self._group_msg_cache.move_to_end(group_id)
 
-            matched = None
-            for cached_entry in queue:
-                if not cached_entry:
-                    continue
-                cached_msg = cached_entry[0]
-                cached_prs = cached_entry[1] if len(cached_entry) > 1 else []
+        matched = None
+        for cached_entry in queue:
+            if not cached_entry:
+                continue
+            cached_msg = cached_entry[0]
+            cached_prs = cached_entry[1] if len(cached_entry) > 1 else []
 
-                ratio = SequenceMatcher(None, cached_msg, message).ratio()
-                if ratio >= threshold and ratio < 1.0:
-                    matched = cached_msg
-                    break
+            ratio = SequenceMatcher(None, cached_msg, message).ratio()
+            if ratio >= threshold and ratio < 1.0:
+                matched = cached_msg
+                break
 
-                if premises and cached_prs:
-                    for cp in cached_prs:
-                        if not cp:
+            if premises and cached_prs:
+                for cp in cached_prs:
+                    if not cp:
+                        continue
+                    for np_item in premises:
+                        if not np_item:
                             continue
-                        for np_item in premises:
-                            if not np_item:
-                                continue
-                            pratio = SequenceMatcher(None, cp, np_item).ratio()
-                            if pratio >= threshold and pratio < 1.0:
-                                matched = cached_msg
-                                break
-                        if matched:
+                        pratio = SequenceMatcher(None, cp, np_item).ratio()
+                        if pratio >= threshold and pratio < 1.0:
+                            matched = cached_msg
                             break
                     if matched:
                         break
+                if matched:
+                    break
 
-            queue.append((message, premises or []))
-            return matched
+        queue.append((message, premises or []))
+        return matched
 
     async def _llm_verify_meme(
         self,
@@ -925,12 +926,11 @@ class PresuppositionValidation(Star):
         if not system_prompt:
             return None
 
-        async with self._cache_lock:
-            queue = self._group_msg_cache.get(group_id)
-            if not queue:
-                return None
+        queue = self._group_msg_cache.get(group_id)
+        if not queue:
+            return None
 
-            entries = list(queue)
+        entries = list(queue)
 
         history_lines = []
         for entry in entries:
