@@ -1,5 +1,5 @@
 name: "astrbot_plugin_presupposition_validation"
 desc: "本插件通过预先分析用户提问中的隐藏前提，能在 AI 回复前拦截掉那些违背常识的造谣式提问，同时利用智能算法识别变换主语的跟风复读行为，支持异步模式下的「先回复、后追击纠错」，在不影响聊天速度的前提下保障机器人回复的智商在线。"
 author: "辉格史观"
-version: "v1.0.7"
+version: "v1.0.8"
 repo: "https://github.com/GenshinGnosticism/astrbot_plugin_presupposition_validation"

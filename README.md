@@ -5,7 +5,7 @@
 **一个为 AstrBot 打造的「事实审计」与「跟风拦截」插件**
 
 [![AstrBot](https://img.shields.io/badge/AstrBot-Plugin-blue)](https://github.com/Soulter/AstrBot)
-[![Version](https://img.shields.io/badge/Version-v1.0.7-green)]()
+[![Version](https://img.shields.io/badge/Version-v1.0.8-green)]()
 [![Python](https://img.shields.io/badge/Python-3.10+-yellow)]()
 
 </div>
@@ -16,6 +16,7 @@
 
 | 版本 | 日期 | 变更 |
 |---|---|---|
+| **v1.0.8** | 2026-03-29 | OpenCode 自查重构：`_evaluate_relation` 消除重复关系判定逻辑；`_try_withdraw_message` 统一至 `_get_session_id`；GC 回收过期群组的 `_sent_bot_msg_ids` 残留条目 |
 | **v1.0.7** | 2026-03-29 | 切换至 AsyncDDGS 彻底消除线程池泄露；移除无意义异步定义与冗余锁；重构 SessionID 获取为独立工具方法；GC 降级为同步函数 |
 | **v1.0.6** | 2026-03-29 | 精准撤回链路（追踪 bot message_id 替代模糊查找）；会话键重构为 time_ns() 绝对唯一 ID；implication/biconditional 逻辑语义补全；缺失纠正文案兜底；Semaphore(10) 并发限流；JSON 提取改为大括号计数器；schema 加载线程锁 + 完整堆栈日志 |
 | **v1.0.5** | 2026-03-29 | 遵从框架日志规范（统一使用 astrbot.api.logger）；补全群组缓存自动清理 GC 闭环；精细化异常捕获（AttributeError 替代 Exception）；插件卸载时清空 schema 缓存防状态污染 |

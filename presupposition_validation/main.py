@@ -38,7 +38,7 @@ def _parse_bool(value, default: bool = False) -> bool:
     "presupposition_validation",
     "presupposition_validation_dev",
     "核查用户提问中隐藏的预设前提，防止基于虚假前提的回答",
-    "1.0.7",
+    "1.0.8",
 )
 class PresuppositionValidation(Star):
 
@@ -66,6 +66,33 @@ class PresuppositionValidation(Star):
         return event.unified_msg_origin
 
     # ==================================================================
+    # 关系评估工具
+    # ==================================================================
+
+    @staticmethod
+    def _evaluate_relation(
+        truths: list[bool],
+        relation: str,
+        false_indices: list[int],
+        premises_len: int,
+    ) -> bool:
+        if not false_indices:
+            return False
+        if relation == "or":
+            return len(false_indices) == premises_len
+        elif relation == "xor":
+            return (premises_len - len(false_indices)) != 1
+        elif relation == "implication":
+            if premises_len >= 2 and truths[0]:
+                return any(not t for t in truths[1:])
+            return bool(false_indices)
+        elif relation == "biconditional":
+            if premises_len >= 2:
+                return truths[0] != truths[1]
+            return bool(false_indices)
+        return True
+
+    # ==================================================================
     # 群组缓存 GC
     # ==================================================================
 
@@ -82,6 +109,10 @@ class PresuppositionValidation(Star):
         for gid in stale:
             self._group_last_active.pop(gid, None)
             self._group_msg_cache.pop(gid, None)
+        stale_prefixes = {f"{gid}:" for gid in stale}
+        for key in list(self._sent_bot_msg_ids):
+            if any(key.startswith(p) for p in stale_prefixes):
+                del self._sent_bot_msg_ids[key]
         logger.debug(
             f"[presupposition_validation] GC 清理 {len(stale)} 个过期群组缓存"
         )
@@ -268,26 +299,10 @@ class PresuppositionValidation(Star):
                         )
 
         llm_false_indices = [i for i, t in enumerate(truths) if not t]
-        true_count = len(truths) - len(llm_false_indices)
 
-        should_correct = False
-        if llm_false_indices:
-            if relation == "or":
-                should_correct = len(llm_false_indices) == len(premises)
-            elif relation == "xor":
-                should_correct = true_count != 1
-            elif relation == "implication":
-                if len(premises) >= 2 and truths[0]:
-                    should_correct = any(not t for t in truths[1:])
-                else:
-                    should_correct = bool(llm_false_indices)
-            elif relation == "biconditional":
-                if len(premises) >= 2:
-                    should_correct = truths[0] != truths[1]
-                else:
-                    should_correct = bool(llm_false_indices)
-            else:
-                should_correct = True
+        should_correct = self._evaluate_relation(
+            truths, relation, llm_false_indices, len(premises)
+        )
 
         if should_correct:
             logger.info(
@@ -330,36 +345,15 @@ class PresuppositionValidation(Star):
                         merged_corrections.append("")
                     merged_corrections[idx] = corr
 
-                if relation == "or":
-                    should_correct = len(all_false_indices) == len(premises)
-                elif relation == "xor":
-                    all_true_count = len(premises) - len(all_false_indices)
-                    should_correct = all_true_count != 1
-                elif relation == "implication":
-                    if len(premises) >= 2:
-                        merged_truths = list(truths)
-                        for idx in search_false:
-                            while len(merged_truths) <= idx:
-                                merged_truths.append(True)
-                            merged_truths[idx] = False
-                        if merged_truths[0]:
-                            should_correct = any(not t for t in merged_truths[1:])
-                        else:
-                            should_correct = True
-                    else:
-                        should_correct = len(all_false_indices) > 0
-                elif relation == "biconditional":
-                    if len(premises) >= 2:
-                        merged_truths = list(truths)
-                        for idx in search_false:
-                            while len(merged_truths) <= idx:
-                                merged_truths.append(True)
-                            merged_truths[idx] = False
-                        should_correct = merged_truths[0] != merged_truths[1]
-                    else:
-                        should_correct = len(all_false_indices) > 0
-                else:
-                    should_correct = len(all_false_indices) > 0
+                merged_truths = list(truths)
+                for idx in search_false:
+                    while len(merged_truths) <= idx:
+                        merged_truths.append(True)
+                    merged_truths[idx] = False
+
+                should_correct = self._evaluate_relation(
+                    merged_truths, relation, all_false_indices, len(premises)
+                )
 
                 if should_correct:
                     logger.info(
@@ -455,9 +449,7 @@ class PresuppositionValidation(Star):
         if not group_id:
             return False
 
-        session = getattr(event, 'get_session_id', lambda: None)()
-        if not session:
-            session = event.unified_msg_origin
+        session = self._get_session_id(event)
         tracked_id = None
         for key in list(self._sent_bot_msg_ids):
             if key.startswith(f"{session}:"):
