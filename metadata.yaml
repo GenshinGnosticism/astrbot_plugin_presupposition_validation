@@ -1,0 +1,6 @@
+name: "AI 事实纠错 (Fact Auditor)"
+desc: "基于预设前提核查的事实审计工具，有效拦截 AI 幻觉与群友跟风。"
+help: "安装后在配置界面填写 LLM 配置即可。支持异步模式、自动撤回与跟风拦截。"
+version: "v1.0.0"
+author: "GenshinGnosticism"
+repo: "https://github.com/GenshinGnosticism/astrbot_plugin_presupposition_validation"
