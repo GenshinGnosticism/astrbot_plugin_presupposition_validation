@@ -14,7 +14,7 @@ import json
 import re
 import string as _string
 import time as _time
-from collections import deque, OrderedDict
+from collections import OrderedDict, deque
 from difflib import SequenceMatcher
 from typing import Optional
 
@@ -26,25 +26,34 @@ from astrbot.api.star import Context, Star, register
 from .config import PluginConfig
 
 
+def _parse_bool(value, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "1", "yes")
+    return default
+
+
 @register(
     "presupposition_validation",
     "presupposition_validation_dev",
     "核查用户提问中隐藏的预设前提，防止基于虚假前提的回答",
-    "1.0.1",
+    "1.0.3",
 )
 class PresuppositionValidation(Star):
 
     _MAX_GROUP_CACHE = 200
     _GROUP_GC_INTERVAL = 300
+    _API_CALL_TIMEOUT = 5.0
 
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.cfg = PluginConfig(**{k: v for k, v in config.items()})
-        self._group_msg_cache: OrderedDict[str, deque] = OrderedDict()
+        self._group_msg_cache: OrderedDict[str, deque[tuple[str, list[str]]]] = OrderedDict()
         self._group_last_active: dict[str, float] = {}
         self._pending_tasks: set[asyncio.Task] = set()
-        self._session_sent_events: dict[str, asyncio.Event] = {}
-        self._pipeline_lock = asyncio.Lock()
+        self._session_sent_events: dict[tuple[str, str], asyncio.Event] = {}
+        self._cache_lock = asyncio.Lock()
 
     # ==================================================================
     # 核心 Hook
@@ -68,11 +77,13 @@ class PresuppositionValidation(Star):
 
         if self.cfg.enable_async_mode:
             umo = event.unified_msg_origin
+            msg_id = getattr(event.message_obj, "message_id", "") or ""
             sent_evt = asyncio.Event()
-            self._session_sent_events[umo] = sent_evt
+            key = (umo, msg_id)
+            self._session_sent_events[key] = sent_evt
 
             task = asyncio.create_task(
-                self._cleanup_pipeline(event, req, user_message, sent_evt),
+                self._cleanup_pipeline(event, req, user_message, sent_evt, key),
                 name="presupposition_validation_check",
             )
             self._pending_tasks.add(task)
@@ -89,7 +100,9 @@ class PresuppositionValidation(Star):
     @filter.after_message_sent()
     async def on_message_sent(self, event: AstrMessageEvent):
         umo = event.unified_msg_origin
-        sent_evt = self._session_sent_events.get(umo)
+        msg_id = getattr(event.message_obj, "message_id", "") or ""
+        key = (umo, msg_id)
+        sent_evt = self._session_sent_events.get(key)
         if sent_evt is not None:
             sent_evt.set()
 
@@ -103,14 +116,14 @@ class PresuppositionValidation(Star):
         req: ProviderRequest,
         user_message: str,
         sent_evt: asyncio.Event,
+        evt_key: tuple,
     ):
         try:
             await self._run_pipeline(event, req, user_message, sent_event=sent_evt)
         except Exception as e:
             logger.error(f"[presupposition_validation] 核查管线异常: {e}")
         finally:
-            umo = event.unified_msg_origin
-            self._session_sent_events.pop(umo, None)
+            self._session_sent_events.pop(evt_key, None)
 
     async def _run_pipeline(
         self,
@@ -123,44 +136,42 @@ class PresuppositionValidation(Star):
             f"[presupposition_validation] 开始预审消息: {user_message[:60]}..."
         )
 
-        # ==================================================================
-        # 步骤一：单次 LLM 全能预审
-        # ==================================================================
         result = await self._unified_llm_check(event, user_message)
         if result is None:
             logger.debug("[presupposition_validation] 预审失败或解析异常，放行")
             return
 
-        is_factual, premise, has_false, correction, needs_search = result
+        is_factual = result["is_factual"]
+        premises = result["premises"]
+        truths = result["truths"]
+        relation = result["relation"]
+        corrections = result["corrections"]
+        needs_search = result["needs_search"]
 
-        # ==================================================================
-        # 步骤二：非事实性问题 → 直接放行
-        # ==================================================================
         if not is_factual:
             logger.debug("[presupposition_validation] 非事实性问题，放行")
             return
 
         logger.debug(
-            f"[presupposition_validation] 预审结果: premise={premise[:40] if premise else '无'}, "
-            f"has_false={has_false}, needs_search={needs_search}"
+            f"[presupposition_validation] 预审结果: premises={premises}, "
+            f"truths={truths}, relation={relation}, needs_search={needs_search}"
         )
 
-        # ==================================================================
-        # 步骤三：跟风造句检测（基于用户原始消息）
-        # ==================================================================
         meme_hit = False
         meme_matched_msg: Optional[str] = None
 
         if self.cfg.enable_meme_detect and event.is_private_chat() is False:
             group_id = event.get_group_id()
             if group_id:
-                meme_matched_msg = self._check_meme_pattern(group_id, user_message)
+                meme_matched_msg = await self._check_meme_pattern(
+                    group_id, user_message, premises
+                )
 
                 if meme_matched_msg is not None:
                     confirmed = True
                     if self.cfg.meme_detect_method == "llm":
                         confirmed = await self._llm_verify_meme(
-                            event, group_id, user_message
+                            event, group_id, user_message, premises
                         )
                         if confirmed is None:
                             confirmed = True
@@ -172,117 +183,122 @@ class PresuppositionValidation(Star):
                             f"action={self.cfg.meme_action_mode}"
                         )
 
-        async with self._pipeline_lock:
-            response_sent = sent_event is not None and sent_event.is_set()
+        response_sent = sent_event is not None and sent_event.is_set()
 
-            # ==================================================================
-            # 步骤四：综合判定 —— 跟风 + 前提错误
-            # ==================================================================
-            if meme_hit:
-                if self.cfg.meme_action_mode == "intercept":
-                    if response_sent:
-                        followup = self._build_meme_followup(meme_matched_msg, user_message)
-                        await self._send_withdraw_or_followup(event, "跟风拦截", followup)
-                    else:
-                        event.stop_event()
-                        try:
-                            await self._send_meme_roast(
-                                event, meme_matched_msg, user_message, req.system_prompt
-                            )
-                        except Exception as e:
-                            logger.error(
-                                f"[presupposition_validation] 发送跟风拦截回复失败: {e}"
-                            )
-                    return
-
-                if self.cfg.meme_action_mode == "check_anyway":
-                    if response_sent:
-                        try:
-                            roast_text = await self._resolve_meme_roast_text(
-                                event, meme_matched_msg, user_message, req.system_prompt
-                            )
-                            if not self._quiet(roast_text):
-                                try:
-                                    msg = self.cfg.meme_async_roast_prefix.format(
-                                        roast=roast_text
-                                    )
-                                except KeyError:
-                                    msg = roast_text
-                                await self._safe_send(event, msg)
-                        except Exception as e:
-                            logger.error(
-                                f"[presupposition_validation] 异步跟风吐槽发送失败: {e}"
-                            )
-                    else:
-                        try:
-                            await self._send_meme_roast(
-                                event, meme_matched_msg, user_message, req.system_prompt
-                            )
-                        except Exception as e:
-                            logger.error(
-                                f"[presupposition_validation] 即时吐槽发送失败，"
-                                f"继续核查流程: {e}"
-                            )
-
-            # ==================================================================
-            # 步骤四续：处理前提错误（LLM 常识已判定为假）
-            # ==================================================================
-            if has_false and premise and correction:
-                logger.info(
-                    f"[presupposition_validation] 发现虚假预设前提, "
-                    f"action={self.cfg.action_mode}, response_sent={response_sent}"
-                )
-                if self.cfg.action_mode == "intercept":
-                    if response_sent:
-                        followup = self._format_correction_followup(premise, correction)
-                        await self._send_withdraw_or_followup(event, "前提纠错", followup)
-                    else:
-                        msg = self._build_intercept_message(premise, correction)
-                        event.stop_event()
-                        await self._safe_send_with_fallback(event, msg)
+        if meme_hit:
+            if self.cfg.meme_action_mode == "intercept":
+                if response_sent:
+                    followup = self._build_meme_followup(meme_matched_msg, user_message)
+                    await self._send_withdraw_or_followup(event, "跟风拦截", followup)
                 else:
-                    if response_sent:
-                        followup = self._format_correction_followup(premise, correction)
-                        await self._send_withdraw_or_followup(event, "前提纠错", followup)
-                    else:
-                        warning = self._build_warning_prefix(premise, correction)
-                        req.system_prompt = f"{warning}\n\n---\n\n{req.system_prompt}"
+                    event.stop_event()
+                    try:
+                        await self._send_meme_roast(
+                            event, meme_matched_msg, user_message, req.system_prompt
+                        )
+                    except Exception as e:
+                        logger.error(
+                            f"[presupposition_validation] 发送跟风拦截回复失败: {e}"
+                        )
                 return
 
-            # ==================================================================
-            # 步骤五：联网搜索兜底（LLM 标记 needs_search 且模式允许）
-            # ==================================================================
-            if needs_search and self.cfg.fact_check_method == "web_search" and premise:
-                logger.info(
-                    f"[presupposition_validation] LLM 无法常识判定，触发联网搜索验证"
-                )
-                if not premise.strip():
-                    return
-                search_result = await self._verify_with_web_search(event, premise)
-                if search_result is not None:
-                    search_has_false, search_correction = search_result
-                    if search_has_false and search_correction:
-                        logger.info(
-                            f"[presupposition_validation] 搜索确认虚假前提, "
-                            f"action={self.cfg.action_mode}"
+            if self.cfg.meme_action_mode == "check_anyway":
+                if response_sent:
+                    try:
+                        roast_text = await self._resolve_meme_roast_text(
+                            event, meme_matched_msg, user_message, req.system_prompt
                         )
-                        search_sent = sent_event is not None and sent_event.is_set()
-                        if self.cfg.action_mode == "intercept":
-                            if search_sent:
-                                followup = self._format_correction_followup(premise, search_correction)
-                                await self._send_withdraw_or_followup(event, "搜索纠错", followup)
-                            else:
-                                msg = self._build_intercept_message(premise, search_correction)
-                                event.stop_event()
-                                await self._safe_send_with_fallback(event, msg)
-                        else:
-                            if search_sent:
-                                followup = self._format_correction_followup(premise, search_correction)
-                                await self._send_withdraw_or_followup(event, "搜索纠错", followup)
-                            else:
-                                warning = self._build_warning_prefix(premise, search_correction)
-                                req.system_prompt = f"{warning}\n\n---\n\n{req.system_prompt}"
-                        return
+                        if not self._quiet(roast_text):
+                            try:
+                                msg = self.cfg.meme_async_roast_prefix.format(
+                                    roast=roast_text
+                                )
+                            except KeyError:
+                                msg = roast_text
+                            await self._safe_send(event, msg)
+                    except Exception as e:
+                        logger.error(
+                            f"[presupposition_validation] 异步跟风吐槽发送失败: {e}"
+                        )
+                else:
+                    try:
+                        await self._send_meme_roast(
+                            event, meme_matched_msg, user_message, req.system_prompt
+                        )
+                    except Exception as e:
+                        logger.error(
+                            f"[presupposition_validation] 即时吐槽发送失败，"
+                            f"继续核查流程: {e}"
+                        )
+
+        llm_false_indices = [i for i, t in enumerate(truths) if not t]
+
+        should_correct = False
+        if llm_false_indices:
+            if relation == "or":
+                should_correct = len(llm_false_indices) == len(premises)
+            else:
+                should_correct = True
+
+        if should_correct:
+            logger.info(
+                f"[presupposition_validation] 发现虚假预设前提(LLM), "
+                f"count={len(llm_false_indices)}, relation={relation}, "
+                f"action={self.cfg.action_mode}, response_sent={response_sent}"
+            )
+            premise_text, correction_text = self._aggregate_corrections(
+                llm_false_indices, premises, corrections
+            )
+            if premise_text and correction_text:
+                await self._handle_correction(
+                    event, req, premise_text, correction_text,
+                    response_sent, "前提纠错",
+                )
+            return
+
+        if needs_search and self.cfg.fact_check_method == "web_search" and premises:
+            uncertain_indices = [
+                i for i in range(len(premises))
+                if i not in llm_false_indices and premises[i].strip()
+            ]
+            search_false: dict[int, str] = {}
+            for idx in uncertain_indices:
+                search_result = await self._verify_with_web_search(
+                    event, premises[idx]
+                )
+                if search_result is not None:
+                    search_is_true, search_correction = search_result
+                    if not search_is_true and search_correction:
+                        search_false[idx] = search_correction
+
+            if search_false:
+                all_false_indices = llm_false_indices + list(search_false.keys())
+                merged_corrections = list(corrections)
+                for idx, corr in search_false.items():
+                    while len(merged_corrections) <= idx:
+                        merged_corrections.append("")
+                    merged_corrections[idx] = corr
+
+                if relation == "or":
+                    should_correct = len(all_false_indices) == len(premises)
+                else:
+                    should_correct = len(all_false_indices) > 0
+
+                if should_correct:
+                    logger.info(
+                        f"[presupposition_validation] 搜索确认虚假前提, "
+                        f"count={len(all_false_indices)}, action={self.cfg.action_mode}"
+                    )
+                    premise_text, correction_text = self._aggregate_corrections(
+                        all_false_indices, premises, merged_corrections
+                    )
+                    search_sent = sent_event is not None and sent_event.is_set()
+                    if premise_text and correction_text:
+                        await self._handle_correction(
+                            event, req, premise_text, correction_text,
+                            search_sent, "搜索纠错",
+                        )
+                    return
 
     # ==================================================================
     # 工具方法
@@ -363,10 +379,13 @@ class PresuppositionValidation(Star):
             if not hasattr(client, "api"):
                 return False
 
-            ret = await client.api.call_action(
-                "get_group_msg_log",
-                group_id=event.get_group_id(),
-                count=10,
+            ret = await asyncio.wait_for(
+                client.api.call_action(
+                    "get_group_msg_log",
+                    group_id=event.get_group_id(),
+                    count=10,
+                ),
+                timeout=self._API_CALL_TIMEOUT,
             )
             if not ret:
                 return False
@@ -381,16 +400,78 @@ class PresuppositionValidation(Star):
                 if str(sender.get("user_id", "")) == str(bot_id):
                     msg_id = msg.get("message_id")
                     if msg_id:
-                        await client.api.call_action(
-                            "delete_msg", message_id=int(msg_id)
+                        await asyncio.wait_for(
+                            client.api.call_action(
+                                "delete_msg", message_id=int(msg_id)
+                            ),
+                            timeout=self._API_CALL_TIMEOUT,
                         )
                         return True
+            return False
+        except asyncio.TimeoutError:
+            logger.warning("[presupposition_validation] 撤回 API 调用超时")
             return False
         except Exception as e:
             logger.debug(
                 f"[presupposition_validation] 撤回尝试失败（降级为追击更正）: {e}"
             )
             return False
+
+    def _aggregate_corrections(
+        self,
+        false_indices: list[int],
+        premises: list[str],
+        corrections: list[str],
+    ) -> tuple[str, str]:
+        error_premises = [premises[i] for i in false_indices if i < len(premises)]
+        error_corrections = [
+            corrections[i]
+            for i in false_indices
+            if i < len(corrections) and corrections[i]
+        ]
+        if not error_premises:
+            return "", ""
+        if len(error_premises) == 1:
+            return (
+                error_premises[0],
+                error_corrections[0] if error_corrections else "",
+            )
+        premise_text = "\n".join(
+            f"{j + 1}. {p}" for j, p in enumerate(error_premises)
+        )
+        correction_text = "\n".join(
+            f"{j + 1}. {c}" for j, c in enumerate(error_corrections)
+        )
+        return premise_text, correction_text
+
+    async def _handle_correction(
+        self,
+        event: AstrMessageEvent,
+        req: ProviderRequest,
+        premise_text: str,
+        correction_text: str,
+        response_sent: bool,
+        reason: str,
+    ):
+        if self.cfg.action_mode == "intercept":
+            if response_sent:
+                followup = self._format_correction_followup(
+                    premise_text, correction_text
+                )
+                await self._send_withdraw_or_followup(event, reason, followup)
+            else:
+                msg = self._build_intercept_message(premise_text, correction_text)
+                event.stop_event()
+                await self._safe_send_with_fallback(event, msg)
+        else:
+            if response_sent:
+                followup = self._format_correction_followup(
+                    premise_text, correction_text
+                )
+                await self._send_withdraw_or_followup(event, reason, followup)
+            else:
+                warning = self._build_warning_prefix(premise_text, correction_text)
+                req.system_prompt = f"{warning}\n\n---\n\n{req.system_prompt}"
 
     # ==================================================================
     # 追击文案构建
@@ -441,7 +522,7 @@ class PresuppositionValidation(Star):
 
     async def _unified_llm_check(
         self, event: AstrMessageEvent, user_message: str
-    ) -> Optional[tuple]:
+    ) -> Optional[dict]:
         provider = self.context.get_using_provider(umo=event.unified_msg_origin)
         if provider is None:
             logger.warning("[presupposition_validation] 未找到可用的 LLM 提供商")
@@ -475,7 +556,7 @@ class PresuppositionValidation(Star):
 
         return self._parse_unified_response(completion)
 
-    def _parse_unified_response(self, text: str) -> Optional[tuple]:
+    def _parse_unified_response(self, text: str) -> Optional[dict]:
         if not text:
             return None
         try:
@@ -483,16 +564,52 @@ class PresuppositionValidation(Star):
             if raw is None:
                 return None
             data = json.loads(raw)
-            premise = self._normalize_premise(
-                str(data.get("extracted_premise", ""))
-            )
-            return (
-                bool(data.get("is_factual_question", False)),
-                premise,
-                bool(data.get("has_false_premise", False)),
-                str(data.get("correction_info", "")).strip(),
-                bool(data.get("needs_search", False)),
-            )
+
+            is_factual = _parse_bool(data.get("is_factual_question"), False)
+
+            premises = data.get("premises")
+            if isinstance(premises, list) and len(premises) > 0:
+                truths = [
+                    _parse_bool(t, True)
+                    for t in data.get("premise_truths", [])
+                ]
+                corrections = [
+                    str(c).strip()
+                    for c in data.get("corrections", [])
+                ]
+                relation = str(data.get("premise_relation", "and")).strip().lower()
+                if relation not in ("and", "or"):
+                    relation = "and"
+                normalized = [self._normalize_premise(str(p)) for p in premises]
+                return {
+                    "is_factual": is_factual,
+                    "premises": normalized,
+                    "truths": truths,
+                    "relation": relation,
+                    "corrections": corrections,
+                    "needs_search": _parse_bool(data.get("needs_search"), False),
+                }
+
+            premise = self._normalize_premise(str(data.get("extracted_premise", "")))
+            has_false = _parse_bool(data.get("has_false_premise"), False)
+            correction = str(data.get("correction_info", "")).strip()
+            if not premise:
+                return {
+                    "is_factual": is_factual,
+                    "premises": [],
+                    "truths": [],
+                    "relation": "and",
+                    "corrections": [],
+                    "needs_search": _parse_bool(data.get("needs_search"), False),
+                }
+            return {
+                "is_factual": is_factual,
+                "premises": [premise],
+                "truths": [False] if has_false else [True],
+                "relation": "and",
+                "corrections": [correction] if has_false else [""],
+                "needs_search": _parse_bool(data.get("needs_search"), False),
+            }
         except (json.JSONDecodeError, KeyError, TypeError) as e:
             logger.warning(f"[presupposition_validation] 解析全能预审 JSON 失败: {e}")
             return None
@@ -591,7 +708,7 @@ class PresuppositionValidation(Star):
             if raw is None:
                 return None
             data = json.loads(raw)
-            return (data.get("is_true", True), data.get("correction", ""))
+            return (_parse_bool(data.get("is_true"), False), data.get("correction", ""))
         except (json.JSONDecodeError, KeyError, TypeError) as e:
             logger.warning(f"[presupposition_validation] 解析搜索验证结果失败: {e}")
             return None
@@ -600,39 +717,63 @@ class PresuppositionValidation(Star):
     # 群聊跟风造句检测
     # ==================================================================
 
-    def _check_meme_pattern(self, group_id: str, message: str) -> Optional[str]:
-        if len(self._group_msg_cache) >= self._MAX_GROUP_CACHE:
-            now = _time.monotonic()
-            stale = [
-                gid for gid, ts in self._group_last_active.items()
-                if now - ts > self._GROUP_GC_INTERVAL
-            ]
-            for gid in stale:
-                self._group_msg_cache.pop(gid, None)
-                self._group_last_active.pop(gid, None)
-
-        self._group_last_active[group_id] = _time.monotonic()
-        self._group_msg_cache.move_to_end(group_id)
-
-        queue = self._group_msg_cache.setdefault(
-            group_id, deque(maxlen=self.cfg.history_window_size)
-        )
+    async def _check_meme_pattern(
+        self,
+        group_id: str,
+        message: str,
+        premises: Optional[list[str]] = None,
+    ) -> Optional[str]:
         threshold = max(0.0, min(1.0, self.cfg.similarity_threshold))
-        matched = None
 
-        for cached_msg in queue:
-            if not cached_msg:
-                continue
-            ratio = SequenceMatcher(None, cached_msg, message).ratio()
-            if ratio >= threshold and ratio < 1.0:
-                matched = cached_msg
-                break
+        async with self._cache_lock:
+            if len(self._group_msg_cache) >= self._MAX_GROUP_CACHE:
+                self._group_msg_cache.popitem(last=False)
 
-        queue.append(message)
-        return matched
+            queue = self._group_msg_cache.get(group_id)
+            if queue is None:
+                queue = deque(maxlen=self.cfg.history_window_size)
+                self._group_msg_cache[group_id] = queue
+
+            self._group_last_active[group_id] = _time.monotonic()
+            self._group_msg_cache.move_to_end(group_id)
+
+            matched = None
+            for cached_entry in queue:
+                if not cached_entry:
+                    continue
+                cached_msg = cached_entry[0]
+                cached_prs = cached_entry[1] if len(cached_entry) > 1 else []
+
+                ratio = SequenceMatcher(None, cached_msg, message).ratio()
+                if ratio >= threshold and ratio < 1.0:
+                    matched = cached_msg
+                    break
+
+                if premises and cached_prs:
+                    for cp in cached_prs:
+                        if not cp:
+                            continue
+                        for np_item in premises:
+                            if not np_item:
+                                continue
+                            pratio = SequenceMatcher(None, cp, np_item).ratio()
+                            if pratio >= threshold and pratio < 1.0:
+                                matched = cached_msg
+                                break
+                        if matched:
+                            break
+                    if matched:
+                        break
+
+            queue.append((message, premises or []))
+            return matched
 
     async def _llm_verify_meme(
-        self, event: AstrMessageEvent, group_id: str, new_message: str
+        self,
+        event: AstrMessageEvent,
+        group_id: str,
+        new_message: str,
+        premises: Optional[list[str]] = None,
     ) -> Optional[bool]:
         provider = self.context.get_using_provider(umo=event.unified_msg_origin)
         if provider is None:
@@ -642,16 +783,33 @@ class PresuppositionValidation(Star):
         if not system_prompt:
             return None
 
-        queue = self._group_msg_cache.get(group_id)
-        if not queue:
-            return None
+        async with self._cache_lock:
+            queue = self._group_msg_cache.get(group_id)
+            if not queue:
+                return None
 
-        history_lines = [f"{i + 1}. {msg}" for i, msg in enumerate(queue) if msg]
+            entries = list(queue)
+
+        history_lines = []
+        for entry in entries:
+            if not entry:
+                continue
+            msg = entry[0]
+            prs = entry[1] if len(entry) > 1 else []
+            if prs:
+                history_lines.append(f"- {msg} (前提: {'; '.join(prs)})")
+            else:
+                history_lines.append(f"- {msg}")
+
         history_text = "\n".join(history_lines)
+
+        premise_info = ""
+        if premises:
+            premise_info = f"\n当前消息提取的前提：{'; '.join(premises)}"
 
         prompt = (
             f"以下是群里的历史提问：\n{history_text}\n\n"
-            f"现在有用户提问：{new_message}\n"
+            f"现在有用户提问：{new_message}{premise_info}\n"
             f"请判断这个新问题仅仅是无意义的改词跟风造句，"
             f"还是一个有其实际求知意义的独立问题？"
             f"请仅回复 True 或 False。"
@@ -675,11 +833,11 @@ class PresuppositionValidation(Star):
         if llm_resp is None:
             return None
 
-        text = llm_resp.completion_text.strip().upper()
-        is_meme = "TRUE" in text
+        text = llm_resp.completion_text.strip()
+        is_meme = text.upper().strip() == "TRUE"
         logger.debug(
             f"[presupposition_validation] LLM 跟风判定: "
-            f"raw={llm_resp.completion_text.strip()[:30]}, result={is_meme}"
+            f"raw={text[:30]}, result={is_meme}"
         )
         return is_meme
 
@@ -781,8 +939,8 @@ class PresuppositionValidation(Star):
         except KeyError:
             return (
                 "⚠️ 您的提问中包含不成立的预设前提：\n\n"
-                f"❌ 「{premise}」— 事实并非如此\n"
-                f"   ✅ 修正：{correction}\n\n"
+                f"❌ {premise}\n\n"
+                f"✅ 修正：\n{correction}\n\n"
                 "请您基于正确的事实重新提问。"
             )
 
@@ -794,7 +952,8 @@ class PresuppositionValidation(Star):
         except KeyError:
             return (
                 "[系统提示：用户提问中包含不成立的预设前提，请先指出错误再回答]\n\n"
-                f"- 「{premise}」是错误的，正确事实是：{correction}\n\n"
+                f"❌ {premise}\n\n"
+                f"✅ 修正：\n{correction}\n\n"
                 "请在回复中先指出上述前提错误，然后基于修正后的事实回答用户的原始问题。"
             )
 
@@ -803,8 +962,11 @@ class PresuppositionValidation(Star):
     # ==================================================================
 
     async def terminate(self):
-        for task in self._pending_tasks:
+        tasks = list(self._pending_tasks)
+        for task in tasks:
             task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         self._pending_tasks.clear()
         self._session_sent_events.clear()
         self._group_msg_cache.clear()

@@ -37,37 +37,52 @@
   "fact_check_method": {
     "description": "llm：仅依靠大模型常识判断，单次 LLM 调用完成全部核查；web_search：当大模型无法通过常识判定时，按需触发联网搜索二次验证。",
     "type": "string",
-    "options": ["llm", "web_search"],
+    "options": [
+      "llm",
+      "web_search"
+    ],
     "default": "llm"
   },
   "action_mode": {
     "description": "intercept：直接拦截并指出错误，不回答原问题；warn_and_answer：指出错误但仍尝试回答。",
     "type": "string",
-    "options": ["intercept", "warn_and_answer"],
+    "options": [
+      "intercept",
+      "warn_and_answer"
+    ],
     "default": "warn_and_answer"
   },
   "meme_detect_method": {
     "description": "algorithm：纯文本相似度算法（快）；llm：算法初筛 + 大模型二次确认（准但多一次 API 调用）。",
     "type": "string",
-    "options": ["algorithm", "llm"],
+    "options": [
+      "algorithm",
+      "llm"
+    ],
     "default": "algorithm"
   },
   "meme_response_mode": {
     "description": "fixed：使用固定文案吐槽；dynamic_llm：调用 LLM 基于人设动态生成吐槽。",
     "type": "string",
-    "options": ["fixed", "dynamic_llm"],
+    "options": [
+      "fixed",
+      "dynamic_llm"
+    ],
     "default": "dynamic_llm"
   },
   "meme_action_mode": {
     "description": "intercept：吐槽后直接拦截；check_anyway：吐槽后仍然继续核查事实，将吐槽与正式回答拼接。",
     "type": "string",
-    "options": ["intercept", "check_anyway"],
+    "options": [
+      "intercept",
+      "check_anyway"
+    ],
     "default": "intercept"
   },
   "unified_check_prompt": {
-    "description": "全能预审 Prompt：一次性完成意图判定、前提提取、事实核查。要求输出 JSON 格式（is_factual_question, extracted_premise, has_false_premise, correction_info, needs_search）。",
+    "description": "全能预审 Prompt：一次性完成意图判定、原子化前提提取、逐前提事实核查与逻辑关系识别。输出 JSON（is_factual_question, premises数组, premise_truths数组, premise_relation, corrections数组, needs_search）。",
     "type": "text",
-    "default": "你是一个专业的消息分析与事实核查引擎。请对用户的消息进行一次性全量分析。\n\n## 核心任务\n\n1. 区分「普通提问」与「预设前提提问」\n2. 如果是预设前提提问，提取其隐藏的前提命题\n3. 判断该前提是否违背常识\n4. 如果你无法通过常识确定，标记为需要联网搜索\n\n## 前提提取三原则\n\n**原子性**：只保留主语+谓语+宾语，剔除「竟然、居然、听说、为什么、既然」等修饰词和语气词。\n**规范化**：统一转换为主动语态的陈述句，不使用疑问句式。\n**去冗余**：去除感叹号、问号、省略号等标点，只保留核心命题。\n\n## 前提提取 Few-shot 示例\n\n| 用户原始消息 | 提取出的 extracted_premise |\n|---|---|\n| 咸菜为什么不加防腐剂？ | 咸菜里不加防腐剂 |\n| 北大居然开原神课！ | 北大开设了原神课 |\n| 听说银价已经比金价贵了，是真的吗 | 银价比金价贵 |\n| 既然林黛玉是虚构人物，那她为什么还要考清华 | 林黛玉考上了清华大学 |\n| 为什么天空是蓝色的 | 天空是蓝色的 |\n\n## 判定准则\n\n**普通提问（is_factual_question: false）**\n- 用户在询问一个开放性问题，没有预设任何事实为真\n- 典型句式：「XX是什么」「XX怎么样」「XX会发生吗」「XX会加防腐剂吗」\n- 纯主观偏好、情绪宣泄、日常打招呼\n- 这类问题没有隐藏前提，直接放行\n\n**预设前提提问（is_factual_question: true）**\n- 用户的问题隐含了一个「被默认为真的前提命题」，而该前提本身可能是假的\n- 典型句式：「为什么XX会发生」「既然XX是真的，那为什么YY」「XX为什么不ZZ」\n- 这类问题预设了「XX已发生」或「XX不ZZ」为事实，需要核查该预设是否成立\n\n## 案例对比\n\n| 用户消息 | is_factual | extracted_premise | has_false | 说明 |\n|---|---|---|---|---|\n| 咸菜会加防腐剂吗？ | false | | | 普通提问，无预设前提 |\n| 咸菜为什么不加防腐剂？ | true | 咸菜里不加防腐剂 | true | 预设「不加」，事实通常会加 |\n| 为什么天空是蓝色的？ | true | 天空是蓝色的 | false | 预设成立，前提正确 |\n| 林黛玉是怎么考上清华的？ | true | 林黛玉考上了清华大学 | true | 预设不成立，她是虚构人物 |\n| 今天天气怎么样？ | false | | | 普通提问 |\n| 北大居然开原神课 | true | 北大开设了原神课 | true | 陈述句暗含客观前提 |\n| 银价为什么比金价贵？ | true | 银价比金价贵 | true | 预设不成立，金价远高于银价 |\n\n## 关键规则\n\n1. 「XX会/能……吗？」是普通提问，不是预设前提提问\n2. 「XX为什么……」「XX为什么不……」通常是预设前提提问（预设了「XX……」为真）\n3. has_false_premise 只在前提确实违背常识时为 true，不确定时为 false 或 needs_search 为 true\n4. correction_info 应简明扼要地陈述正确事实\n5. 宁可放行也不要误判\n\n请返回严格的 JSON 格式，不要包含任何其他文字：\n{\"is_factual_question\": true或false, \"extracted_premise\": \"提取出的核心客观前提（遵循提取三原则），不需要核查时留空字符串\", \"has_false_premise\": true或false, \"correction_info\": \"如果前提有误，简要说明真相；否则留空字符串\", \"needs_search\": true或false}"
+    "default": "你是一个专业的消息分析与事实核查引擎。请对用户的消息进行一次性全量分析。\n\n## 核心任务\n\n1. 区分「普通提问」与「预设前提提问」\n2. 如果是预设前提提问，将复杂句式拆解为原子化前提列表\n3. 逐个判断每个前提是否违背常识\n4. 识别前提之间的逻辑关系（并列/且 vs 选择/或）\n5. 如果你无法通过常识确定，标记为需要联网搜索\n\n## 前提提取三原则\n\n**原子性**：每个前提只保留主语+谓语+宾语，剔除「竟然、居然、听说、为什么、既然」等修饰词和语气词。如果句子包含多个独立命题，必须拆分为多个前提。\n**规范化**：统一转换为主动语态的陈述句，不使用疑问句式。\n**去冗余**：去除感叹号、问号、省略号等标点，只保留核心命题。\n\n## 多前提拆解规则\n\n1. 「A 且 B」关系（并列、递进、因果）：拆为多个前提，premise_relation 设为 \"and\"\n   - 例：「清华和北大都开了原神课」→ premises: [\"清华开设了原神课\", \"北大开设了原神课\"]\n   - 例：「林黛玉考上清华后去了北大读研」→ premises: [\"林黛玉考上了清华大学\", \"林黛玉在北大读研\"]\n2. 「A 或 B」关系（选择）：拆为多个前提，premise_relation 设为 \"or\"\n   - 例：「清华或北大开了原神课」→ premises: [\"清华开设了原神课\", \"北大开设了原神课\"], premise_relation: \"or\"\n3. 单前提：premises 数组只有一个元素，premise_relation 默认 \"and\"\n4. 无法拆解的复杂句：尽力拆解，不确定的部分合并为一个前提\n\n## 判定准则\n\n**普通提问（is_factual_question: false）**\n- 用户在询问一个开放性问题，没有预设任何事实为真\n- 典型句式：「XX是什么」「XX怎么样」「XX会发生吗」「XX会加防腐剂吗」\n- 纯主观偏好、情绪宣泄、日常打招呼\n- 这类问题没有隐藏前提，直接放行，premises 为空数组\n\n**预设前提提问（is_factual_question: true）**\n- 用户的问题隐含了一个或多个「被默认为真的前提命题」，而该前提本身可能是假的\n- 典型句式：「为什么XX会发生」「既然XX是真的，那为什么YY」「XX为什么不ZZ」\n- 需要核查每个预设是否成立\n\n## 案例对比\n\n| 用户消息 | is_factual | premises | premise_truths | relation | 说明 |\n|---|---|---|---|---|---|\n| 咸菜会加防腐剂吗？ | false | [] | [] | \"and\" | 普通提问 |\n| 咸菜为什么不加防腐剂？ | true | [\"咸菜里不加防腐剂\"] | [true] | \"and\" | 单前提，预设成立 |\n| 北大和清华都开了原神课！ | true | [\"北大开设了原神课\", \"清华开设了原神课\"] | [false, false] | \"and\" | 多前提，并列 |\n| 清华或北大开了原神课，是真的吗 | true | [\"清华开设了原神课\", \"北大开设了原神课\"] | [false, false] | \"or\" | 多前提，选择 |\n| 林黛玉是怎么考上清华又去北大读研的？ | true | [\"林黛玉考上了清华大学\", \"林黛玉在北大读研\"] | [false, false] | \"and\" | 多前提，递进 |\n| 今天天气怎么样？ | false | [] | [] | \"and\" | 普通提问 |\n| 为什么天空是蓝色的？ | true | [\"天空是蓝色的\"] | [true] | \"and\" | 预设成立 |\n\n## 关键规则\n\n1. 「XX会/能……吗？」是普通提问，不是预设前提提问\n2. 「XX为什么……」「XX为什么不……」通常是预设前提提问\n3. premise_truths 中每个值仅在该前提违背常识时为 false，不确定时为 true 或 needs_search 为 true\n4. corrections 数组与 premises 一一对应，仅对 premise_truths 为 false 的前提提供纠正，其余为空字符串 \"\"\n5. 宁可放行也不要误判\n\n请返回严格的 JSON 格式，不要包含任何其他文字：\n{\"is_factual_question\": true或false, \"premises\": [\"前提1\", \"前提2\", ...], \"premise_truths\": [true, false, ...], \"premise_relation\": \"and\"或\"or\", \"corrections\": [\"\", \"纠正文案\", ...], \"needs_search\": true或false}"
   },
   "meme_llm_check_prompt": {
     "description": "用于 LLM 二次确认是否为跟风造句的 System Prompt。要求仅回复 True 或 False。",
@@ -112,22 +127,21 @@
   "intercept_message_text": {
     "description": "拦截模式下发送给用户的完整纠错消息。可用占位符：{premise}、{correction}。",
     "type": "text",
-    "default": "⚠️ 您的提问中包含不成立的预设前提：\n\n❌ 「{premise}」— 事实并非如此\n   ✅ 修正：{correction}\n\n请您基于正确的事实重新提问。"
+    "default": "⚠️ 您的提问中包含不成立的预设前提：\n\n❌ {premise}\n\n✅ 修正：\n{correction}\n\n请您基于正确的事实重新提问。"
   },
   "warning_prefix_text": {
     "description": "warn_and_answer 模式下注入到 system_prompt 的提示文案。可用占位符：{premise}、{correction}。",
     "type": "text",
-    "default": "[系统提示：用户提问中包含不成立的预设前提，请先指出错误再回答]\n\n- 「{premise}」是错误的，正确事实是：{correction}\n\n请在回复中先指出上述前提错误，然后基于修正后的事实回答用户的原始问题。"
+    "default": "[系统提示：用户提问中包含不成立的预设前提，请先指出错误再回答]\n\n❌ {premise}\n\n✅ 修正：\n{correction}\n\n请在回复中先指出上述前提错误，然后基于修正后的事实回答用户的原始问题。"
   },
   "correction_followup_text": {
     "description": "异步追击纠错时附加在前缀后的正文内容。可用占位符：{premise}、{correction}。",
     "type": "string",
-    "default": "「{premise}」— 事实并非如此\n✅ 修正：{correction}"
+    "default": "❌ {premise}\n\n✅ 修正：\n{correction}"
   },
   "meme_followup_text": {
     "description": "异步模式下跟风拦截追击消息。可用占位符：{original}、{copy}。当 {original} 为空时自动降级为简版。",
     "type": "string",
     "default": "检测到跟风造句！\n原问题：「{original}」\n跟风提问：「{copy}」\n拒绝回答跟风恶搞。"
   }
-}
 }
