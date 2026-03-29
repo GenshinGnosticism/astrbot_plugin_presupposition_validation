@@ -38,7 +38,7 @@ def _parse_bool(value, default: bool = False) -> bool:
     "presupposition_validation",
     "presupposition_validation_dev",
     "核查用户提问中隐藏的预设前提，防止基于虚假前提的回答",
-    "1.0.3",
+    "1.0.4",
 )
 class PresuppositionValidation(Star):
 
@@ -146,6 +146,7 @@ class PresuppositionValidation(Star):
         truths = result["truths"]
         relation = result["relation"]
         corrections = result["corrections"]
+        logic_flaw = result.get("logic_flaw", "")
         needs_search = result["needs_search"]
 
         if not is_factual:
@@ -232,11 +233,14 @@ class PresuppositionValidation(Star):
                         )
 
         llm_false_indices = [i for i, t in enumerate(truths) if not t]
+        true_count = len(truths) - len(llm_false_indices)
 
         should_correct = False
         if llm_false_indices:
             if relation == "or":
                 should_correct = len(llm_false_indices) == len(premises)
+            elif relation == "xor":
+                should_correct = true_count != 1
             else:
                 should_correct = True
 
@@ -252,7 +256,7 @@ class PresuppositionValidation(Star):
             if premise_text and correction_text:
                 await self._handle_correction(
                     event, req, premise_text, correction_text,
-                    response_sent, "前提纠错",
+                    response_sent, "前提纠错", logic_flaw=logic_flaw,
                 )
             return
 
@@ -281,6 +285,9 @@ class PresuppositionValidation(Star):
 
                 if relation == "or":
                     should_correct = len(all_false_indices) == len(premises)
+                elif relation == "xor":
+                    all_true_count = len(premises) - len(all_false_indices)
+                    should_correct = all_true_count != 1
                 else:
                     should_correct = len(all_false_indices) > 0
 
@@ -296,9 +303,19 @@ class PresuppositionValidation(Star):
                     if premise_text and correction_text:
                         await self._handle_correction(
                             event, req, premise_text, correction_text,
-                            search_sent, "搜索纠错",
+                            search_sent, "搜索纠错", logic_flaw=logic_flaw,
                         )
                     return
+
+        if logic_flaw:
+            logger.info(
+                f"[presupposition_validation] 检测到逻辑谬误: {logic_flaw[:60]}"
+            )
+            logic_sent = sent_event is not None and sent_event.is_set()
+            await self._handle_correction(
+                event, req, "", "", logic_sent, "逻辑批驳",
+                logic_flaw=logic_flaw,
+            )
 
     # ==================================================================
     # 工具方法
@@ -452,7 +469,31 @@ class PresuppositionValidation(Star):
         correction_text: str,
         response_sent: bool,
         reason: str,
+        logic_flaw: str = "",
     ):
+        if logic_flaw and not premise_text:
+            msg = self._build_logic_flaw_message(logic_flaw)
+            if self.cfg.action_mode == "intercept":
+                if response_sent:
+                    await self._send_withdraw_or_followup(event, reason, msg)
+                else:
+                    event.stop_event()
+                    await self._safe_send_with_fallback(event, msg)
+            else:
+                if response_sent:
+                    await self._send_withdraw_or_followup(event, reason, msg)
+                else:
+                    req.system_prompt = (
+                        f"[系统提示：用户论证存在逻辑漏洞]\n"
+                        f"{logic_flaw}\n\n"
+                        f"请在回复中指出该逻辑问题，然后基于正确逻辑回答。\n\n"
+                        f"---\n\n{req.system_prompt}"
+                    )
+            return
+
+        if logic_flaw and correction_text:
+            correction_text = f"{correction_text}\n\n⚠️ 逻辑漏洞：{logic_flaw}"
+
         if self.cfg.action_mode == "intercept":
             if response_sent:
                 followup = self._format_correction_followup(
@@ -472,6 +513,13 @@ class PresuppositionValidation(Star):
             else:
                 warning = self._build_warning_prefix(premise_text, correction_text)
                 req.system_prompt = f"{warning}\n\n---\n\n{req.system_prompt}"
+
+    def _build_logic_flaw_message(self, logic_flaw: str) -> str:
+        return (
+            "⚠️ 您的论证存在逻辑漏洞：\n\n"
+            f"{logic_flaw}\n\n"
+            "请修正您的论证逻辑后再提问。"
+        )
 
     # ==================================================================
     # 追击文案构建
@@ -532,6 +580,9 @@ class PresuppositionValidation(Star):
         if not system_prompt:
             return None
 
+        if self.cfg.enable_argumentative_mode and self.cfg.argumentative_prompt_appendix:
+            system_prompt = system_prompt + self.cfg.argumentative_prompt_appendix
+
         try:
             llm_resp = await asyncio.wait_for(
                 provider.text_chat(
@@ -578,15 +629,17 @@ class PresuppositionValidation(Star):
                     for c in data.get("corrections", [])
                 ]
                 relation = str(data.get("premise_relation", "and")).strip().lower()
-                if relation not in ("and", "or"):
+                if relation not in ("and", "or", "xor", "implication", "biconditional"):
                     relation = "and"
                 normalized = [self._normalize_premise(str(p)) for p in premises]
+                logic_flaw = str(data.get("logic_flaw", "")).strip()
                 return {
                     "is_factual": is_factual,
                     "premises": normalized,
                     "truths": truths,
                     "relation": relation,
                     "corrections": corrections,
+                    "logic_flaw": logic_flaw,
                     "needs_search": _parse_bool(data.get("needs_search"), False),
                 }
 
@@ -600,6 +653,7 @@ class PresuppositionValidation(Star):
                     "truths": [],
                     "relation": "and",
                     "corrections": [],
+                    "logic_flaw": "",
                     "needs_search": _parse_bool(data.get("needs_search"), False),
                 }
             return {
@@ -608,6 +662,7 @@ class PresuppositionValidation(Star):
                 "truths": [False] if has_false else [True],
                 "relation": "and",
                 "corrections": [correction] if has_false else [""],
+                "logic_flaw": "",
                 "needs_search": _parse_bool(data.get("needs_search"), False),
             }
         except (json.JSONDecodeError, KeyError, TypeError) as e:

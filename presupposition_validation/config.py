@@ -79,6 +79,11 @@ class PluginConfig(BaseModel):
         title="跟风相似度阈值",
         description="0 ~ 1 之间，越接近 1 要求越严格。建议 0.65 ~ 0.85。",
     )
+    enable_argumentative_mode: bool = Field(
+        default=False,
+        title="对线模式（实验性）",
+        description="【实验性】开启最极致的逻辑审查，不仅核查事实，还会对因果关系、排他性逻辑进行深度「对线」。注入逻辑学专家人格，识别 XOR、蕴含等复杂逻辑谬误。",
+    )
 
     # ── 🧠 模式与策略选择 ─────────────────────────────────────
 
@@ -113,7 +118,12 @@ class PluginConfig(BaseModel):
     unified_check_prompt: str = Field(
         default=_schema_default("unified_check_prompt"),
         title="[Prompt] 全能预审指令",
-        description="一次性完成意图判定、前提提取、事实核查。输出 JSON（is_factual_question, extracted_premise, has_false_premise, correction_info, needs_search）。",
+        description="一次性完成意图判定、原子化前提提取、逐前提事实核查与逻辑关系识别。输出 JSON（is_factual_question, premises数组, premise_truths数组, premise_relation, corrections数组, needs_search）。",
+    )
+    argumentative_prompt_appendix: str = Field(
+        default=_schema_default("argumentative_prompt_appendix"),
+        title="[Prompt] 对线模式附加指令",
+        description="对线模式开启时追加到全能预审 Prompt 末尾的逻辑学专家指令。仅在 enable_argumentative_mode 为 True 时生效。",
     )
     meme_llm_check_prompt: str = Field(
         default=_schema_default("meme_llm_check_prompt"),

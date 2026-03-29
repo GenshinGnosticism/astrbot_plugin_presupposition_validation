@@ -143,5 +143,15 @@
     "description": "异步模式下跟风拦截追击消息。可用占位符：{original}、{copy}。当 {original} 为空时自动降级为简版。",
     "type": "string",
     "default": "检测到跟风造句！\n原问题：「{original}」\n跟风提问：「{copy}」\n拒绝回答跟风恶搞。"
+  },
+  "enable_argumentative_mode": {
+    "description": "【实验性】开启最极致的逻辑审查，不仅核查事实，还会对因果关系、排他性逻辑进行深度「对线」。注入逻辑学专家人格，识别 XOR、蕴含等复杂逻辑谬误。",
+    "type": "bool",
+    "default": false
+  },
+  "argumentative_prompt_appendix": {
+    "description": "对线模式开启时追加到全能预审 Prompt 末尾的逻辑学专家指令。仅在 enable_argumentative_mode 为 True 时生效。",
+    "type": "text",
+    "default": "\n\n## 对线模式：逻辑学专家审查（当前已启用）\n\n你现在以「形式逻辑学专家」的身份进行审查，除了事实核查外，还要深度分析用户的论证结构。\n\n### 逻辑关系识别\n\n除基础的 AND/OR 外，还需识别以下复杂逻辑关系：\n- **XOR（异或/排他或）**：A 或 B 成立但不同时成立。premise_relation 设为 \"xor\"\n  - 例：「他要么是中国人，要么是日本人」→ 只有一个为真时命题成立\n- **IMPLICATION（蕴含/因果关系）**：A 蕴含 B（如果 A 则 B）。premise_relation 设为 \"implication\"\n  - 例：「因为他是清华的，所以成绩一定很好」→ A 不一定推导出 B\n- **BICONDITIONAL（双条件）**：A 当且仅当 B。premise_relation 设为 \"biconditional\"\n  - 例：「他是博士毕业当且仅当他读过研究生」→ 需要双向验证\n\n### 逻辑谬误检测\n\n在 logic_flaw 字段中描述发现的逻辑谬误（如果有）。常见谬误包括：\n- **不当类比**：把本质上不同的事物强行类比\n- **非黑即白**：只给出两个选项，忽略其他可能性\n- **诉诸无知**：因为无法证明某事为假，就认为它为真\n- **诉诸权威**：用权威而非论据来支持观点\n- **滑坡谬误**：假设一件事会导致一系列极端后果\n- **因果倒置**：把结果当原因\n- **稻草人谬误**：曲解对方观点后进行攻击\n- **循环论证**：结论本身作为前提\n- **合成谬误**：认为部分为真则整体为真\n- **分割谬误**：认为整体为真则部分为真\n\n### 更新后的 JSON 输出格式\n\n在原有基础上增加 logic_flaw 字段：\n{\"is_factual_question\": true或false, \"premises\": [...], \"premise_truths\": [...], \"premise_relation\": \"and\"或\"or\"或\"xor\"或\"implication\"或\"biconditional\", \"corrections\": [...], \"logic_flaw\": \"逻辑谬误描述，无谬误时为空字符串\", \"needs_search\": true或false}\n\n注意：\n1. logic_flaw 仅在检测到逻辑谬误时填写具体描述，否则为空字符串 \"\"\n2. premise_relation 扩展支持 \"xor\"、\"implication\"、\"biconditional\" 三种新关系\n3. 即使前提全部为真（truths 全为 true），如果存在逻辑谬误，也应填写 logic_flaw"
   }
 }
