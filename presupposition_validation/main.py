@@ -38,13 +38,14 @@ def _parse_bool(value, default: bool = False) -> bool:
     "presupposition_validation",
     "presupposition_validation_dev",
     "核查用户提问中隐藏的预设前提，防止基于虚假前提的回答",
-    "1.0.5",
+    "1.0.6",
 )
 class PresuppositionValidation(Star):
 
     _MAX_GROUP_CACHE = 200
     _GROUP_GC_INTERVAL = 300
     _API_CALL_TIMEOUT = 5.0
+    _MAX_CONCURRENT_TASKS = 10
 
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -52,8 +53,10 @@ class PresuppositionValidation(Star):
         self._group_msg_cache: OrderedDict[str, deque[tuple[str, list[str]]]] = OrderedDict()
         self._group_last_active: dict[str, float] = {}
         self._pending_tasks: set[asyncio.Task] = set()
-        self._session_sent_events: dict[tuple[str, str], asyncio.Event] = {}
+        self._session_sent_events: dict[str, asyncio.Event] = {}
+        self._sent_bot_msg_ids: dict[str, int] = {}
         self._cache_lock = asyncio.Lock()
+        self._task_semaphore = asyncio.Semaphore(self._MAX_CONCURRENT_TASKS)
 
     # ==================================================================
     # 群组缓存 GC
@@ -100,14 +103,16 @@ class PresuppositionValidation(Star):
             return
 
         if self.cfg.enable_async_mode:
-            umo = event.unified_msg_origin
-            msg_id = getattr(event.message_obj, "message_id", "") or ""
+            task_id = f"{getattr(event, 'get_session_id', lambda: event.unified_msg_origin)()}:{_time.time_ns()}"
             sent_evt = asyncio.Event()
-            key = (umo, msg_id)
-            self._session_sent_events[key] = sent_evt
+            self._session_sent_events[task_id] = sent_evt
+
+            async def _guarded_pipeline(t_id=task_id):
+                async with self._task_semaphore:
+                    await self._cleanup_pipeline(event, req, user_message, sent_evt, t_id)
 
             task = asyncio.create_task(
-                self._cleanup_pipeline(event, req, user_message, sent_evt, key),
+                _guarded_pipeline(),
                 name="presupposition_validation_check",
             )
             self._pending_tasks.add(task)
@@ -123,12 +128,13 @@ class PresuppositionValidation(Star):
 
     @filter.after_message_sent()
     async def on_message_sent(self, event: AstrMessageEvent):
-        umo = event.unified_msg_origin
-        msg_id = getattr(event.message_obj, "message_id", "") or ""
-        key = (umo, msg_id)
-        sent_evt = self._session_sent_events.get(key)
-        if sent_evt is not None:
-            sent_evt.set()
+        session = getattr(event, 'get_session_id', lambda: None)()
+        if not session:
+            session = event.unified_msg_origin
+        prefix = f"{session}:"
+        for key in list(self._session_sent_events):
+            if key.startswith(prefix):
+                self._session_sent_events[key].set()
 
     # ==================================================================
     # 核查管线（串行/异步共用）
@@ -140,7 +146,7 @@ class PresuppositionValidation(Star):
         req: ProviderRequest,
         user_message: str,
         sent_evt: asyncio.Event,
-        evt_key: tuple,
+        evt_key: str,
     ):
         try:
             await self._run_pipeline(event, req, user_message, sent_event=sent_evt)
@@ -265,6 +271,16 @@ class PresuppositionValidation(Star):
                 should_correct = len(llm_false_indices) == len(premises)
             elif relation == "xor":
                 should_correct = true_count != 1
+            elif relation == "implication":
+                if len(premises) >= 2 and truths[0]:
+                    should_correct = any(not t for t in truths[1:])
+                else:
+                    should_correct = bool(llm_false_indices)
+            elif relation == "biconditional":
+                if len(premises) >= 2:
+                    should_correct = truths[0] != truths[1]
+                else:
+                    should_correct = bool(llm_false_indices)
             else:
                 should_correct = True
 
@@ -277,7 +293,9 @@ class PresuppositionValidation(Star):
             premise_text, correction_text = self._aggregate_corrections(
                 llm_false_indices, premises, corrections
             )
-            if premise_text and correction_text:
+            if not correction_text:
+                correction_text = "经核查，该提问的前提存在事实性偏差。"
+            if premise_text or correction_text:
                 await self._handle_correction(
                     event, req, premise_text, correction_text,
                     response_sent, "前提纠错", logic_flaw=logic_flaw,
@@ -312,6 +330,29 @@ class PresuppositionValidation(Star):
                 elif relation == "xor":
                     all_true_count = len(premises) - len(all_false_indices)
                     should_correct = all_true_count != 1
+                elif relation == "implication":
+                    if len(premises) >= 2:
+                        merged_truths = list(truths)
+                        for idx in search_false:
+                            while len(merged_truths) <= idx:
+                                merged_truths.append(True)
+                            merged_truths[idx] = False
+                        if merged_truths[0]:
+                            should_correct = any(not t for t in merged_truths[1:])
+                        else:
+                            should_correct = True
+                    else:
+                        should_correct = len(all_false_indices) > 0
+                elif relation == "biconditional":
+                    if len(premises) >= 2:
+                        merged_truths = list(truths)
+                        for idx in search_false:
+                            while len(merged_truths) <= idx:
+                                merged_truths.append(True)
+                            merged_truths[idx] = False
+                        should_correct = merged_truths[0] != merged_truths[1]
+                    else:
+                        should_correct = len(all_false_indices) > 0
                 else:
                     should_correct = len(all_false_indices) > 0
 
@@ -323,8 +364,10 @@ class PresuppositionValidation(Star):
                     premise_text, correction_text = self._aggregate_corrections(
                         all_false_indices, premises, merged_corrections
                     )
+                    if not correction_text:
+                        correction_text = "经核查，该提问的前提存在事实性偏差。"
                     search_sent = sent_event is not None and sent_event.is_set()
-                    if premise_text and correction_text:
+                    if premise_text or correction_text:
                         await self._handle_correction(
                             event, req, premise_text, correction_text,
                             search_sent, "搜索纠错", logic_flaw=logic_flaw,
@@ -402,6 +445,20 @@ class PresuppositionValidation(Star):
     async def _try_withdraw_message(self, event: AstrMessageEvent) -> bool:
         if not self.cfg.enable_recall:
             return False
+
+        group_id = event.get_group_id()
+        if not group_id:
+            return False
+
+        session = getattr(event, 'get_session_id', lambda: None)()
+        if not session:
+            session = event.unified_msg_origin
+        tracked_id = None
+        for key in list(self._sent_bot_msg_ids):
+            if key.startswith(f"{session}:"):
+                tracked_id = self._sent_bot_msg_ids.pop(key)
+                break
+
         try:
             platform = event.get_platform_name()
             if platform != "aiocqhttp":
@@ -420,35 +477,39 @@ class PresuppositionValidation(Star):
             if not hasattr(client, "api"):
                 return False
 
-            ret = await asyncio.wait_for(
+            target_id = tracked_id
+            if not target_id:
+                ret = await asyncio.wait_for(
+                    client.api.call_action(
+                        "get_group_msg_log",
+                        group_id=group_id,
+                        count=10,
+                    ),
+                    timeout=self._API_CALL_TIMEOUT,
+                )
+                if not ret:
+                    return False
+                messages = ret.get("data", ret) if isinstance(ret, dict) else ret
+                if not isinstance(messages, list):
+                    return False
+                bot_id = event.get_self_id()
+                for msg in messages:
+                    sender = msg.get("sender", {})
+                    if str(sender.get("user_id", "")) == str(bot_id):
+                        target_id = msg.get("message_id")
+                        if target_id:
+                            break
+
+            if not target_id:
+                return False
+
+            await asyncio.wait_for(
                 client.api.call_action(
-                    "get_group_msg_log",
-                    group_id=event.get_group_id(),
-                    count=10,
+                    "delete_msg", message_id=int(target_id)
                 ),
                 timeout=self._API_CALL_TIMEOUT,
             )
-            if not ret:
-                return False
-
-            messages = ret.get("data", ret) if isinstance(ret, dict) else ret
-            if not isinstance(messages, list):
-                return False
-
-            bot_id = event.get_self_id()
-            for msg in messages:
-                sender = msg.get("sender", {})
-                if str(sender.get("user_id", "")) == str(bot_id):
-                    msg_id = msg.get("message_id")
-                    if msg_id:
-                        await asyncio.wait_for(
-                            client.api.call_action(
-                                "delete_msg", message_id=int(msg_id)
-                            ),
-                            timeout=self._API_CALL_TIMEOUT,
-                        )
-                        return True
-            return False
+            return True
         except asyncio.TimeoutError:
             logger.warning("[presupposition_validation] 撤回 API 调用超时")
             return False
@@ -644,13 +705,15 @@ class PresuppositionValidation(Star):
 
             premises = data.get("premises")
             if isinstance(premises, list) and len(premises) > 0:
+                raw_truths = data.get("premise_truths", [])
+                raw_corrections = data.get("corrections", [])
                 truths = [
-                    _parse_bool(t, True)
-                    for t in data.get("premise_truths", [])
+                    _parse_bool(raw_truths[i], True) if i < len(raw_truths) else True
+                    for i in range(len(premises))
                 ]
                 corrections = [
-                    str(c).strip()
-                    for c in data.get("corrections", [])
+                    str(raw_corrections[i]).strip() if i < len(raw_corrections) else ""
+                    for i in range(len(premises))
                 ]
                 relation = str(data.get("premise_relation", "and")).strip().lower()
                 if relation not in ("and", "or", "xor", "implication", "biconditional"):
@@ -1001,9 +1064,17 @@ class PresuppositionValidation(Star):
                 if block.startswith("{"):
                     return block
 
-        match = re.search(r"\{.*\}", text, re.DOTALL)
-        if match:
-            return match.group(0).strip()
+        depth = 0
+        start = -1
+        for i, ch in enumerate(text):
+            if ch == '{':
+                if depth == 0:
+                    start = i
+                depth += 1
+            elif ch == '}':
+                depth -= 1
+                if depth == 0 and start >= 0:
+                    return text[start:i + 1]
         return None
 
     # ==================================================================
@@ -1048,6 +1119,7 @@ class PresuppositionValidation(Star):
             await asyncio.gather(*tasks, return_exceptions=True)
         self._pending_tasks.clear()
         self._session_sent_events.clear()
+        self._sent_bot_msg_ids.clear()
         self._group_msg_cache.clear()
         self._group_last_active.clear()
         from .config import invalidate_schema_cache

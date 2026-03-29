@@ -5,7 +5,7 @@
 **一个为 AstrBot 打造的「事实审计」与「跟风拦截」插件**
 
 [![AstrBot](https://img.shields.io/badge/AstrBot-Plugin-blue)](https://github.com/Soulter/AstrBot)
-[![Version](https://img.shields.io/badge/Version-v1.0.5-green)]()
+[![Version](https://img.shields.io/badge/Version-v1.0.6-green)]()
 [![Python](https://img.shields.io/badge/Python-3.10+-yellow)]()
 
 </div>
@@ -16,6 +16,7 @@
 
 | 版本 | 日期 | 变更 |
 |---|---|---|
+| **v1.0.6** | 2026-03-29 | 精准撤回链路（追踪 bot message_id 替代模糊查找）；会话键重构为 time_ns() 绝对唯一 ID；implication/biconditional 逻辑语义补全；缺失纠正文案兜底；Semaphore(10) 并发限流；JSON 提取改为大括号计数器；schema 加载线程锁 + 完整堆栈日志 |
 | **v1.0.5** | 2026-03-29 | 遵从框架日志规范（统一使用 astrbot.api.logger）；补全群组缓存自动清理 GC 闭环；精细化异常捕获（AttributeError 替代 Exception）；插件卸载时清空 schema 缓存防状态污染 |
 | **v1.0.4** | 2026-03-29 | 实验性「对线模式」上线：支持 XOR/蕴含等复杂逻辑审查与谬误检测；多前提 AND/OR 审计；修复异步竞态、JSON 提取漏洞及内存泄漏 |
 | v1.0.3 | 2026-03-29 | 多前提逻辑审计升级：原子化前提拆解、AND/OR 复合句式逐一核证、纠错文案聚合编号列表、跟风检测升级至前提级比对 |
