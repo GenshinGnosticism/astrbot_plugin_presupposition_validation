@@ -38,7 +38,7 @@ def _parse_bool(value, default: bool = False) -> bool:
     "presupposition_validation",
     "presupposition_validation_dev",
     "核查用户提问中隐藏的预设前提，防止基于虚假前提的回答",
-    "1.0.4",
+    "1.0.5",
 )
 class PresuppositionValidation(Star):
 
@@ -56,6 +56,27 @@ class PresuppositionValidation(Star):
         self._cache_lock = asyncio.Lock()
 
     # ==================================================================
+    # 群组缓存 GC
+    # ==================================================================
+
+    async def _gc_group_cache(self):
+        if len(self._group_last_active) <= 100:
+            return
+        now = _time.monotonic()
+        stale = [
+            gid for gid, ts in self._group_last_active.items()
+            if now - ts > self._GROUP_GC_INTERVAL
+        ]
+        if not stale:
+            return
+        for gid in stale:
+            self._group_last_active.pop(gid, None)
+            self._group_msg_cache.pop(gid, None)
+        logger.debug(
+            f"[presupposition_validation] GC 清理 {len(stale)} 个过期群组缓存"
+        )
+
+    # ==================================================================
     # 核心 Hook
     # ==================================================================
 
@@ -66,11 +87,14 @@ class PresuppositionValidation(Star):
         if not self.cfg.enabled:
             return
 
+        await self._gc_group_cache()
+
         user_message = ""
-        try:
-            user_message = (event.message_str or "").strip()
-        except Exception:
-            return
+        if hasattr(event, "message_str"):
+            try:
+                user_message = (event.message_str or "").strip()
+            except AttributeError:
+                return
 
         if not user_message or len(user_message) < 3:
             return
@@ -1025,3 +1049,6 @@ class PresuppositionValidation(Star):
         self._pending_tasks.clear()
         self._session_sent_events.clear()
         self._group_msg_cache.clear()
+        self._group_last_active.clear()
+        from .config import invalidate_schema_cache
+        invalidate_schema_cache()
