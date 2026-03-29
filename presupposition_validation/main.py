@@ -10,6 +10,7 @@
 """
 
 import asyncio
+import importlib.util
 import json
 import re
 import string as _string
@@ -38,7 +39,7 @@ def _parse_bool(value, default: bool = False) -> bool:
     "presupposition_validation",
     "presupposition_validation_dev",
     "核查用户提问中隐藏的预设前提，防止基于虚假前提的回答",
-    "1.0.8",
+    "1.0.9",
 )
 class PresuppositionValidation(Star):
 
@@ -56,6 +57,7 @@ class PresuppositionValidation(Star):
         self._session_sent_events: dict[str, asyncio.Event] = {}
         self._sent_bot_msg_ids: dict[str, int] = {}
         self._task_semaphore = asyncio.Semaphore(self._MAX_CONCURRENT_TASKS)
+        self._search_driver: Optional[str] = self._detect_search_driver()
 
     @staticmethod
     def _get_session_id(event: AstrMessageEvent) -> str:
@@ -64,6 +66,40 @@ class PresuppositionValidation(Star):
             if sid:
                 return str(sid)
         return event.unified_msg_origin
+
+    _SEARCH_TOOL_KEYWORDS = (
+        "search", "web_search", "tavily", "serp", "bing",
+        "google_search", "duckduckgo", "brave_search",
+    )
+
+    def _detect_search_driver(self) -> Optional[str]:
+        framework_tool = self._probe_framework_search_tool()
+        if framework_tool:
+            logger.info(
+                f"[presupposition_validation] 检测到框架已注册搜索工具 "
+                f"「{framework_tool}」，将优先使用框架原生搜索能力"
+            )
+            return "framework"
+        if importlib.util.find_spec("duckduckgo_search") is not None:
+            logger.info(
+                "[presupposition_validation] 检测到本地 duckduckgo-search，"
+                "已启用独立搜索"
+            )
+            return "duckduckgo"
+        logger.info(
+            "[presupposition_validation] 未检测到搜索依赖，将降级至纯 LLM 常识校验"
+        )
+        return None
+
+    def _probe_framework_search_tool(self) -> Optional[str]:
+        try:
+            tool_mgr = self.context.get_llm_tool_manager()
+            for kw in self._SEARCH_TOOL_KEYWORDS:
+                if tool_mgr.get_func(kw):
+                    return kw
+        except Exception:
+            pass
+        return None
 
     # ==================================================================
     # 关系评估工具
@@ -571,10 +607,17 @@ class PresuppositionValidation(Star):
                         f"请在回复中指出该逻辑问题，然后基于正确逻辑回答。\n\n"
                         f"---\n\n{req.system_prompt}"
                     )
+                    if self._search_driver is None and self.cfg.no_search_disclaimer:
+                        req.system_prompt = (
+                            f"{self.cfg.no_search_disclaimer}\n\n"
+                            f"{req.system_prompt}"
+                        )
             return
 
         if logic_flaw and correction_text:
             correction_text = f"{correction_text}\n\n⚠️ 逻辑漏洞：{logic_flaw}"
+            if self._search_driver is None and self.cfg.no_search_disclaimer:
+                correction_text = f"{correction_text}\n\n{self.cfg.no_search_disclaimer}"
 
         if self.cfg.action_mode == "intercept":
             if response_sent:
@@ -597,11 +640,14 @@ class PresuppositionValidation(Star):
                 req.system_prompt = f"{warning}\n\n---\n\n{req.system_prompt}"
 
     def _build_logic_flaw_message(self, logic_flaw: str) -> str:
-        return (
+        parts = [
             "⚠️ 您的论证存在逻辑漏洞：\n\n"
             f"{logic_flaw}\n\n"
             "请修正您的论证逻辑后再提问。"
-        )
+        ]
+        if self._search_driver is None and self.cfg.no_search_disclaimer:
+            parts.append(self.cfg.no_search_disclaimer)
+        return "\n\n".join(parts)
 
     # ==================================================================
     # 追击文案构建
@@ -777,6 +823,8 @@ class PresuppositionValidation(Star):
     async def _verify_with_web_search(
         self, event: AstrMessageEvent, premise: str
     ) -> Optional[tuple]:
+        if self._search_driver is None:
+            return None
         provider = self.context.get_using_provider(umo=event.unified_msg_origin)
         if provider is None:
             return None
@@ -795,27 +843,9 @@ class PresuppositionValidation(Star):
     async def _verify_single_with_search(
         self, provider, presupposition: str
     ) -> Optional[tuple]:
-        try:
-            from duckduckgo_search import AsyncDDGS
-
-            async with AsyncDDGS() as ddgs:
-                search_results = await ddgs.text(presupposition, max_results=3)
-        except ImportError:
-            logger.error(
-                "[presupposition_validation] web_search 模式需要安装 "
-                "duckduckgo-search 库，请执行: pip install duckduckgo-search"
-            )
+        search_summary = await self._execute_search(presupposition)
+        if not search_summary:
             return None
-        except Exception as e:
-            logger.error(f"[presupposition_validation] 搜索出错: {e}")
-            return None
-
-        if not search_results:
-            return None
-
-        search_summary = "\n".join(
-            f"- {r.get('title', '')}: {r.get('body', '')}" for r in search_results
-        )
 
         verify_prompt = (
             f"需要验证的命题：{presupposition}\n\n"
@@ -835,6 +865,80 @@ class PresuppositionValidation(Star):
             return None
 
         return self._parse_verify_response(verify_resp.completion_text)
+
+    async def _execute_search(self, query: str) -> Optional[str]:
+        if self._search_driver == "framework":
+            return await self._search_via_framework(query)
+        if self._search_driver == "duckduckgo":
+            return await self._search_via_ddg(query)
+        return None
+
+    async def _search_via_framework(self, query: str) -> Optional[str]:
+        try:
+            from astrbot.core.agent.tool import ToolSet
+
+            tool_mgr = self.context.get_llm_tool_manager()
+            search_tool = None
+            for kw in self._SEARCH_TOOL_KEYWORDS:
+                candidate = tool_mgr.get_func(kw)
+                if candidate:
+                    search_tool = candidate
+                    break
+            if search_tool is None:
+                return None
+
+            tool_set = ToolSet()
+            tool_set.add_tool(search_tool)
+
+            prov_id = await self.context.get_current_chat_provider_id(
+                self._get_session_id(self.context)
+            )
+        except Exception as e:
+            logger.debug(
+                f"[presupposition_validation] 框架搜索工具探测失败: {e}"
+            )
+            return None
+
+        try:
+            llm_resp = await self.context.tool_loop_agent(
+                event=None,
+                chat_provider_id=prov_id,
+                prompt=f"请搜索以下内容并返回摘要：{query}",
+                tools=tool_set,
+                max_steps=3,
+                tool_call_timeout=10,
+            )
+            if llm_resp and hasattr(llm_resp, "completion_text"):
+                text = llm_resp.completion_text.strip()
+                if text:
+                    return text
+        except Exception as e:
+            logger.debug(f"[presupposition_validation] 框架搜索调用失败: {e}")
+
+        return None
+
+    async def _search_via_ddg(self, query: str) -> Optional[str]:
+        try:
+            from duckduckgo_search import AsyncDDGS
+
+            async with AsyncDDGS() as ddgs:
+                results = await ddgs.text(query, max_results=3)
+        except ImportError:
+            logger.error(
+                "[presupposition_validation] duckduckgo-search 运行时导入失败，"
+                "请执行: pip install duckduckgo-search"
+            )
+            return None
+        except Exception as e:
+            logger.error(f"[presupposition_validation] DuckDuckGo 搜索出错: {e}")
+            return None
+
+        if not results:
+            return None
+
+        return "\n".join(
+            f"- {r.get('title', '')}: {r.get('body', '')}" for r in results
+        )
 
     def _parse_verify_response(self, text: str) -> Optional[tuple]:
         if not text:

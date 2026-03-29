@@ -136,6 +136,14 @@ class PluginConfig(BaseModel):
         title="[Prompt] 对线模式附加指令",
         description="对线模式开启时追加到全能预审 Prompt 末尾的逻辑学专家指令。仅在 enable_argumentative_mode 为 True 时生效。",
     )
+    no_search_disclaimer: str = Field(
+        default=_schema_default(
+            "no_search_disclaimer",
+            "⚠️ 注意：由于缺乏实时联网能力，以上逻辑批驳基于截至训练数据截止日期的知识，可能无法覆盖最新事实。",
+        ),
+        title="无搜索免责声明",
+        description="对线模式下，当无联网搜索能力时，在逻辑批驳文案末尾追加的训练数据免责声明。留空则不追加。",
+    )
     meme_llm_check_prompt: str = Field(
         default=_schema_default("meme_llm_check_prompt"),
         title="[Prompt] 跟风判定系统指令",
