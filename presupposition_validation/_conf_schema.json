@@ -1,0 +1,133 @@
+{
+  "enabled": {
+    "description": "总开关。关闭后插件将完全不起作用，所有消息直接放行。",
+    "type": "bool",
+    "default": true
+  },
+  "api_request_timeout": {
+    "description": "所有 LLM 和网络请求的超时秒数。超时后自动放行，不阻塞正常对话。",
+    "type": "int",
+    "default": 15
+  },
+  "enable_async_mode": {
+    "description": "【实验性】开启后核查任务将在后台异步执行，不阻塞主回复流程。可降低闲聊延迟，但存在竞态：若主回复先于核查完成发出，纠错消息将作为补充追加发送。",
+    "type": "bool",
+    "default": false
+  },
+  "enable_recall": {
+    "description": "异步模式下，发现事实错误且主回复已发出时，尝试撤回错误消息（仅 QQ/aiocqhttp，需管理员权限）。",
+    "type": "bool",
+    "default": false
+  },
+  "enable_meme_detect": {
+    "description": "开启后，将拦截群聊中高度相似的复读造句。仅群聊生效。",
+    "type": "bool",
+    "default": true
+  },
+  "history_window_size": {
+    "description": "记录最近 N 条群聊消息用于相似度比对，建议 3 ~ 10。",
+    "type": "int",
+    "default": 5
+  },
+  "similarity_threshold": {
+    "description": "0 ~ 1 之间，越接近 1 要求越严格。建议 0.65 ~ 0.85。",
+    "type": "float",
+    "default": 0.75
+  },
+  "fact_check_method": {
+    "description": "llm：仅依靠大模型常识判断，单次 LLM 调用完成全部核查；web_search：当大模型无法通过常识判定时，按需触发联网搜索二次验证。",
+    "type": "string",
+    "options": ["llm", "web_search"],
+    "default": "llm"
+  },
+  "action_mode": {
+    "description": "intercept：直接拦截并指出错误，不回答原问题；warn_and_answer：指出错误但仍尝试回答。",
+    "type": "string",
+    "options": ["intercept", "warn_and_answer"],
+    "default": "warn_and_answer"
+  },
+  "meme_detect_method": {
+    "description": "algorithm：纯文本相似度算法（快）；llm：算法初筛 + 大模型二次确认（准但多一次 API 调用）。",
+    "type": "string",
+    "options": ["algorithm", "llm"],
+    "default": "algorithm"
+  },
+  "meme_response_mode": {
+    "description": "fixed：使用固定文案吐槽；dynamic_llm：调用 LLM 基于人设动态生成吐槽。",
+    "type": "string",
+    "options": ["fixed", "dynamic_llm"],
+    "default": "dynamic_llm"
+  },
+  "meme_action_mode": {
+    "description": "intercept：吐槽后直接拦截；check_anyway：吐槽后仍然继续核查事实，将吐槽与正式回答拼接。",
+    "type": "string",
+    "options": ["intercept", "check_anyway"],
+    "default": "intercept"
+  },
+  "unified_check_prompt": {
+    "description": "全能预审 Prompt：一次性完成意图判定、前提提取、事实核查。要求输出 JSON 格式（is_factual_question, extracted_premise, has_false_premise, correction_info, needs_search）。",
+    "type": "text",
+    "default": "你是一个专业的消息分析与事实核查引擎。请对用户的消息进行一次性全量分析。\n\n## 核心任务\n\n1. 区分「普通提问」与「预设前提提问」\n2. 如果是预设前提提问，提取其隐藏的前提命题\n3. 判断该前提是否违背常识\n4. 如果你无法通过常识确定，标记为需要联网搜索\n\n## 前提提取三原则\n\n**原子性**：只保留主语+谓语+宾语，剔除「竟然、居然、听说、为什么、既然」等修饰词和语气词。\n**规范化**：统一转换为主动语态的陈述句，不使用疑问句式。\n**去冗余**：去除感叹号、问号、省略号等标点，只保留核心命题。\n\n## 前提提取 Few-shot 示例\n\n| 用户原始消息 | 提取出的 extracted_premise |\n|---|---|\n| 咸菜为什么不加防腐剂？ | 咸菜里不加防腐剂 |\n| 北大居然开原神课！ | 北大开设了原神课 |\n| 听说银价已经比金价贵了，是真的吗 | 银价比金价贵 |\n| 既然林黛玉是虚构人物，那她为什么还要考清华 | 林黛玉考上了清华大学 |\n| 为什么天空是蓝色的 | 天空是蓝色的 |\n\n## 判定准则\n\n**普通提问（is_factual_question: false）**\n- 用户在询问一个开放性问题，没有预设任何事实为真\n- 典型句式：「XX是什么」「XX怎么样」「XX会发生吗」「XX会加防腐剂吗」\n- 纯主观偏好、情绪宣泄、日常打招呼\n- 这类问题没有隐藏前提，直接放行\n\n**预设前提提问（is_factual_question: true）**\n- 用户的问题隐含了一个「被默认为真的前提命题」，而该前提本身可能是假的\n- 典型句式：「为什么XX会发生」「既然XX是真的，那为什么YY」「XX为什么不ZZ」\n- 这类问题预设了「XX已发生」或「XX不ZZ」为事实，需要核查该预设是否成立\n\n## 案例对比\n\n| 用户消息 | is_factual | extracted_premise | has_false | 说明 |\n|---|---|---|---|---|\n| 咸菜会加防腐剂吗？ | false | | | 普通提问，无预设前提 |\n| 咸菜为什么不加防腐剂？ | true | 咸菜里不加防腐剂 | true | 预设「不加」，事实通常会加 |\n| 为什么天空是蓝色的？ | true | 天空是蓝色的 | false | 预设成立，前提正确 |\n| 林黛玉是怎么考上清华的？ | true | 林黛玉考上了清华大学 | true | 预设不成立，她是虚构人物 |\n| 今天天气怎么样？ | false | | | 普通提问 |\n| 北大居然开原神课 | true | 北大开设了原神课 | true | 陈述句暗含客观前提 |\n| 银价为什么比金价贵？ | true | 银价比金价贵 | true | 预设不成立，金价远高于银价 |\n\n## 关键规则\n\n1. 「XX会/能……吗？」是普通提问，不是预设前提提问\n2. 「XX为什么……」「XX为什么不……」通常是预设前提提问（预设了「XX……」为真）\n3. has_false_premise 只在前提确实违背常识时为 true，不确定时为 false 或 needs_search 为 true\n4. correction_info 应简明扼要地陈述正确事实\n5. 宁可放行也不要误判\n\n请返回严格的 JSON 格式，不要包含任何其他文字：\n{\"is_factual_question\": true或false, \"extracted_premise\": \"提取出的核心客观前提（遵循提取三原则），不需要核查时留空字符串\", \"has_false_premise\": true或false, \"correction_info\": \"如果前提有误，简要说明真相；否则留空字符串\", \"needs_search\": true或false}"
+  },
+  "meme_llm_check_prompt": {
+    "description": "用于 LLM 二次确认是否为跟风造句的 System Prompt。要求仅回复 True 或 False。",
+    "type": "text",
+    "default": "你是一个聊天群的消息分析助手。群聊中有人发送了一条与历史消息句式非常相似的提问。\n\n请根据以下信息判断：这条新提问究竟是无意义的\"改词跟风/复读恶搞\"，还是一个有其实际求知意义的独立问题？\n\n判断标准：\n- 仅仅替换了主语、地名、人名等关键词但句式完全相同 → 跟风（True）\n- 虽然句式相似，但确实提出了不同的实质性问题 → 有意义（False）\n- 无法确定时 → 倾向于判定为有意义（False）\n\n请仅回复 True 或 False，不要包含任何其他文字。"
+  },
+  "meme_dynamic_reply_prompt": {
+    "description": "动态生成跟风吐槽回复的 System Prompt。可用占位符：{bot_persona}、{original_message}、{copy_message}",
+    "type": "text",
+    "default": "{bot_persona}现在群聊中有人正在玩「跟风造句」的梗——群友模仿别人的提问句式，只替换几个关键词来恶搞。\n\n原问题：「{original_message}」\n跟风提问：「{copy_message}」\n\n要求：\n1. 不要回答问题本身，问题本身就是个跟风恶搞\n2. 察觉到他们在玩梗跟风，请根据你的人设对这种跟风造句的行为进行吐槽、生气或幽默的回应\n3. 回复要简短有力（一两句话即可），保持你的人设风格\n4. 不要使用 markdown 格式"
+  },
+  "search_verify_prompt": {
+    "description": "联网搜索模式下根据搜索结果验证前提的 System Prompt。",
+    "type": "text",
+    "default": "你是一个专业的事实核查助手。根据提供的搜索结果，判断给定命题是否为真。\n\n请严格按照以下 JSON 格式返回结果：\n{\n  \"is_true\": true或false,\n  \"correction\": \"如果为假，提供基于搜索结果的修正事实；如果为真，留空字符串\"\n}\n\n规则：\n1. 只有在搜索结果明确反驳命题时才判定为 false\n2. 搜索结果不足以判断时应判定为 true（宁可放行）\n3. 只返回 JSON"
+  },
+  "meme_fixed_reply_text": {
+    "description": "跟风命中且 meme_response_mode 为 fixed 时的回复内容。若留空则不发送此提示，实现静默拦截。",
+    "type": "string",
+    "default": "检测到高相似度句式，拒绝跟风造句！"
+  },
+  "error_fallback_text": {
+    "description": "遇到 LLM API 崩溃或网络超时时的兜底回复。若留空则保持沉默，直接放行原始消息。",
+    "type": "string",
+    "default": "抱歉，我的大脑暂时短路了，没法核查这句话的真伪……"
+  },
+  "recall_success_prefix": {
+    "description": "撤回错误消息成功后，纠错消息的开头文案。若留空则直接发送纠错正文，不加前缀。",
+    "type": "string",
+    "default": "❌ 已撤回刚才的错误回复，纠正如下："
+  },
+  "recall_fail_prefix": {
+    "description": "撤回失败（或不支持撤回）时，追击纠错消息的开头文案。若留空则直接发送纠错正文，不加前缀。",
+    "type": "string",
+    "default": "⚠️ 补充更正："
+  },
+  "meme_async_roast_prefix": {
+    "description": "异步模式下跟风吐槽晚于主回复发出时的追击开头文案。可用占位符：{roast}。若留空则不发送。",
+    "type": "string",
+    "default": "⚠️ 补充吐槽：{roast}"
+  },
+  "intercept_message_text": {
+    "description": "拦截模式下发送给用户的完整纠错消息。可用占位符：{premise}、{correction}。",
+    "type": "text",
+    "default": "⚠️ 您的提问中包含不成立的预设前提：\n\n❌ 「{premise}」— 事实并非如此\n   ✅ 修正：{correction}\n\n请您基于正确的事实重新提问。"
+  },
+  "warning_prefix_text": {
+    "description": "warn_and_answer 模式下注入到 system_prompt 的提示文案。可用占位符：{premise}、{correction}。",
+    "type": "text",
+    "default": "[系统提示：用户提问中包含不成立的预设前提，请先指出错误再回答]\n\n- 「{premise}」是错误的，正确事实是：{correction}\n\n请在回复中先指出上述前提错误，然后基于修正后的事实回答用户的原始问题。"
+  },
+  "correction_followup_text": {
+    "description": "异步追击纠错时附加在前缀后的正文内容。可用占位符：{premise}、{correction}。",
+    "type": "string",
+    "default": "「{premise}」— 事实并非如此\n✅ 修正：{correction}"
+  },
+  "meme_followup_text": {
+    "description": "异步模式下跟风拦截追击消息。可用占位符：{original}、{copy}。当 {original} 为空时自动降级为简版。",
+    "type": "string",
+    "default": "检测到跟风造句！\n原问题：「{original}」\n跟风提问：「{copy}」\n拒绝回答跟风恶搞。"
+  }
+}
+}

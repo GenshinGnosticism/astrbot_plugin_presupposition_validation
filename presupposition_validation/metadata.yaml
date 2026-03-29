@@ -1,0 +1,5 @@
+name: presupposition_validation
+author: presupposition_validation_dev
+version: 1.0.0
+description: 用于核查用户提问中隐藏预设前提的 AstrBot 插件
+display_name: 预设前提核查

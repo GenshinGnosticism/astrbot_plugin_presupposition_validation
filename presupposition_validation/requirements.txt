@@ -1,0 +1,5 @@
+# 网络搜索依赖（仅 web_search 核查模式需要）
+# 安装方式：pip install duckduckgo-search
+duckduckgo-search>=6.0.0
+# Pydantic 用于类型安全的配置模型（AstrBot 已内置，此处仅为显式声明）
+pydantic>=2.0.0
