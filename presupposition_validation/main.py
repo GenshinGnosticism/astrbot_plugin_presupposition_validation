@@ -11,8 +11,10 @@
 
 import asyncio
 import json
+import re
 import string as _string
-from collections import deque
+import time as _time
+from collections import deque, OrderedDict
 from difflib import SequenceMatcher
 from typing import Optional
 
@@ -28,16 +30,21 @@ from .config import PluginConfig
     "presupposition_validation",
     "presupposition_validation_dev",
     "核查用户提问中隐藏的预设前提，防止基于虚假前提的回答",
-    "2.2.0",
+    "1.0.1",
 )
 class PresuppositionValidation(Star):
+
+    _MAX_GROUP_CACHE = 200
+    _GROUP_GC_INTERVAL = 300
 
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.cfg = PluginConfig(**{k: v for k, v in config.items()})
-        self._group_msg_cache: dict[str, deque] = {}
+        self._group_msg_cache: OrderedDict[str, deque] = OrderedDict()
+        self._group_last_active: dict[str, float] = {}
         self._pending_tasks: set[asyncio.Task] = set()
         self._session_sent_events: dict[str, asyncio.Event] = {}
+        self._pipeline_lock = asyncio.Lock()
 
     # ==================================================================
     # 核心 Hook
@@ -70,6 +77,7 @@ class PresuppositionValidation(Star):
             )
             self._pending_tasks.add(task)
             task.add_done_callback(self._pending_tasks.discard)
+            await asyncio.sleep(0.05)
             return
 
         await self._run_pipeline(event, req, user_message, sent_event=None)
@@ -164,116 +172,117 @@ class PresuppositionValidation(Star):
                             f"action={self.cfg.meme_action_mode}"
                         )
 
-        response_sent = sent_event is not None and sent_event.is_set()
+        async with self._pipeline_lock:
+            response_sent = sent_event is not None and sent_event.is_set()
 
-        # ==================================================================
-        # 步骤四：综合判定 —— 跟风 + 前提错误
-        # ==================================================================
-        if meme_hit:
-            if self.cfg.meme_action_mode == "intercept":
-                if response_sent:
-                    followup = self._build_meme_followup(meme_matched_msg, user_message)
-                    await self._send_withdraw_or_followup(event, "跟风拦截", followup)
-                else:
-                    event.stop_event()
-                    try:
-                        await self._send_meme_roast(
-                            event, meme_matched_msg, user_message, req.system_prompt
-                        )
-                    except Exception as e:
-                        logger.error(
-                            f"[presupposition_validation] 发送跟风拦截回复失败: {e}"
-                        )
-                return
-
-            if self.cfg.meme_action_mode == "check_anyway":
-                if response_sent:
-                    try:
-                        roast_text = await self._resolve_meme_roast_text(
-                            event, meme_matched_msg, user_message, req.system_prompt
-                        )
-                        if not self._quiet(roast_text):
-                            try:
-                                msg = self.cfg.meme_async_roast_prefix.format(
-                                    roast=roast_text
-                                )
-                            except KeyError:
-                                msg = roast_text
-                            await self._safe_send(event, msg)
-                    except Exception as e:
-                        logger.error(
-                            f"[presupposition_validation] 异步跟风吐槽发送失败: {e}"
-                        )
-                else:
-                    try:
-                        await self._send_meme_roast(
-                            event, meme_matched_msg, user_message, req.system_prompt
-                        )
-                    except Exception as e:
-                        logger.error(
-                            f"[presupposition_validation] 即时吐槽发送失败，"
-                            f"继续核查流程: {e}"
-                        )
-
-        # ==================================================================
-        # 步骤四续：处理前提错误（LLM 常识已判定为假）
-        # ==================================================================
-        if has_false and premise and correction:
-            logger.info(
-                f"[presupposition_validation] 发现虚假预设前提, "
-                f"action={self.cfg.action_mode}, response_sent={response_sent}"
-            )
-            if self.cfg.action_mode == "intercept":
-                if response_sent:
-                    followup = self._format_correction_followup(premise, correction)
-                    await self._send_withdraw_or_followup(event, "前提纠错", followup)
-                else:
-                    msg = self._build_intercept_message(premise, correction)
-                    event.stop_event()
-                    await self._safe_send_with_fallback(event, msg)
-            else:
-                if response_sent:
-                    followup = self._format_correction_followup(premise, correction)
-                    await self._send_withdraw_or_followup(event, "前提纠错", followup)
-                else:
-                    warning = self._build_warning_prefix(premise, correction)
-                    req.system_prompt = f"{warning}\n\n---\n\n{req.system_prompt}"
-            return
-
-        # ==================================================================
-        # 步骤五：联网搜索兜底（LLM 标记 needs_search 且模式允许）
-        # ==================================================================
-        if needs_search and self.cfg.fact_check_method == "web_search" and premise:
-            logger.info(
-                f"[presupposition_validation] LLM 无法常识判定，触发联网搜索验证"
-            )
-            if not premise.strip():
-                return
-            search_result = await self._verify_with_web_search(event, premise)
-            if search_result is not None:
-                search_has_false, search_correction = search_result
-                if search_has_false and search_correction:
-                    logger.info(
-                        f"[presupposition_validation] 搜索确认虚假前提, "
-                        f"action={self.cfg.action_mode}"
-                    )
-                    search_sent = sent_event is not None and sent_event.is_set()
-                    if self.cfg.action_mode == "intercept":
-                        if search_sent:
-                            followup = self._format_correction_followup(premise, search_correction)
-                            await self._send_withdraw_or_followup(event, "搜索纠错", followup)
-                        else:
-                            msg = self._build_intercept_message(premise, search_correction)
-                            event.stop_event()
-                            await self._safe_send_with_fallback(event, msg)
+            # ==================================================================
+            # 步骤四：综合判定 —— 跟风 + 前提错误
+            # ==================================================================
+            if meme_hit:
+                if self.cfg.meme_action_mode == "intercept":
+                    if response_sent:
+                        followup = self._build_meme_followup(meme_matched_msg, user_message)
+                        await self._send_withdraw_or_followup(event, "跟风拦截", followup)
                     else:
-                        if search_sent:
-                            followup = self._format_correction_followup(premise, search_correction)
-                            await self._send_withdraw_or_followup(event, "搜索纠错", followup)
-                        else:
-                            warning = self._build_warning_prefix(premise, search_correction)
-                            req.system_prompt = f"{warning}\n\n---\n\n{req.system_prompt}"
+                        event.stop_event()
+                        try:
+                            await self._send_meme_roast(
+                                event, meme_matched_msg, user_message, req.system_prompt
+                            )
+                        except Exception as e:
+                            logger.error(
+                                f"[presupposition_validation] 发送跟风拦截回复失败: {e}"
+                            )
                     return
+
+                if self.cfg.meme_action_mode == "check_anyway":
+                    if response_sent:
+                        try:
+                            roast_text = await self._resolve_meme_roast_text(
+                                event, meme_matched_msg, user_message, req.system_prompt
+                            )
+                            if not self._quiet(roast_text):
+                                try:
+                                    msg = self.cfg.meme_async_roast_prefix.format(
+                                        roast=roast_text
+                                    )
+                                except KeyError:
+                                    msg = roast_text
+                                await self._safe_send(event, msg)
+                        except Exception as e:
+                            logger.error(
+                                f"[presupposition_validation] 异步跟风吐槽发送失败: {e}"
+                            )
+                    else:
+                        try:
+                            await self._send_meme_roast(
+                                event, meme_matched_msg, user_message, req.system_prompt
+                            )
+                        except Exception as e:
+                            logger.error(
+                                f"[presupposition_validation] 即时吐槽发送失败，"
+                                f"继续核查流程: {e}"
+                            )
+
+            # ==================================================================
+            # 步骤四续：处理前提错误（LLM 常识已判定为假）
+            # ==================================================================
+            if has_false and premise and correction:
+                logger.info(
+                    f"[presupposition_validation] 发现虚假预设前提, "
+                    f"action={self.cfg.action_mode}, response_sent={response_sent}"
+                )
+                if self.cfg.action_mode == "intercept":
+                    if response_sent:
+                        followup = self._format_correction_followup(premise, correction)
+                        await self._send_withdraw_or_followup(event, "前提纠错", followup)
+                    else:
+                        msg = self._build_intercept_message(premise, correction)
+                        event.stop_event()
+                        await self._safe_send_with_fallback(event, msg)
+                else:
+                    if response_sent:
+                        followup = self._format_correction_followup(premise, correction)
+                        await self._send_withdraw_or_followup(event, "前提纠错", followup)
+                    else:
+                        warning = self._build_warning_prefix(premise, correction)
+                        req.system_prompt = f"{warning}\n\n---\n\n{req.system_prompt}"
+                return
+
+            # ==================================================================
+            # 步骤五：联网搜索兜底（LLM 标记 needs_search 且模式允许）
+            # ==================================================================
+            if needs_search and self.cfg.fact_check_method == "web_search" and premise:
+                logger.info(
+                    f"[presupposition_validation] LLM 无法常识判定，触发联网搜索验证"
+                )
+                if not premise.strip():
+                    return
+                search_result = await self._verify_with_web_search(event, premise)
+                if search_result is not None:
+                    search_has_false, search_correction = search_result
+                    if search_has_false and search_correction:
+                        logger.info(
+                            f"[presupposition_validation] 搜索确认虚假前提, "
+                            f"action={self.cfg.action_mode}"
+                        )
+                        search_sent = sent_event is not None and sent_event.is_set()
+                        if self.cfg.action_mode == "intercept":
+                            if search_sent:
+                                followup = self._format_correction_followup(premise, search_correction)
+                                await self._send_withdraw_or_followup(event, "搜索纠错", followup)
+                            else:
+                                msg = self._build_intercept_message(premise, search_correction)
+                                event.stop_event()
+                                await self._safe_send_with_fallback(event, msg)
+                        else:
+                            if search_sent:
+                                followup = self._format_correction_followup(premise, search_correction)
+                                await self._send_withdraw_or_followup(event, "搜索纠错", followup)
+                            else:
+                                warning = self._build_warning_prefix(premise, search_correction)
+                                req.system_prompt = f"{warning}\n\n---\n\n{req.system_prompt}"
+                        return
 
     # ==================================================================
     # 工具方法
@@ -495,7 +504,12 @@ class PresuppositionValidation(Star):
             return ""
         text = text.lower()
         text = text.translate(
-            str.maketrans("", "", _string.punctuation + "，。！？、；：""''（）【】《》…—·")
+            str.maketrans(
+                "", "",
+                _string.punctuation
+                + "，。！？、；：""''（）【】《》…—·「」『』"
+                + "\u201c\u201d\u2018\u2019"
+            )
         )
         text = " ".join(text.split())
         return text
@@ -587,6 +601,19 @@ class PresuppositionValidation(Star):
     # ==================================================================
 
     def _check_meme_pattern(self, group_id: str, message: str) -> Optional[str]:
+        if len(self._group_msg_cache) >= self._MAX_GROUP_CACHE:
+            now = _time.monotonic()
+            stale = [
+                gid for gid, ts in self._group_last_active.items()
+                if now - ts > self._GROUP_GC_INTERVAL
+            ]
+            for gid in stale:
+                self._group_msg_cache.pop(gid, None)
+                self._group_last_active.pop(gid, None)
+
+        self._group_last_active[group_id] = _time.monotonic()
+        self._group_msg_cache.move_to_end(group_id)
+
         queue = self._group_msg_cache.setdefault(
             group_id, deque(maxlen=self.cfg.history_window_size)
         )
@@ -729,21 +756,17 @@ class PresuppositionValidation(Star):
     @staticmethod
     def _extract_json(text: str) -> Optional[str]:
         text = text.strip()
-        if text.startswith("{"):
-            return text
 
         if "```" in text:
-            start = text.find("```") + 3
-            if "json" in text[start : start + 10]:
-                start = text.find("json", start) + 4
-            end = text.find("```", start)
-            if end > start:
-                return text[start:end].strip()
+            match = re.search(r"```(?:json)?\s*\n?(.*?)\n?\s*```", text, re.DOTALL)
+            if match:
+                block = match.group(1).strip()
+                if block.startswith("{"):
+                    return block
 
-        first = text.find("{")
-        last = text.rfind("}")
-        if first >= 0 and last > first:
-            return text[first : last + 1]
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        if match:
+            return match.group(0).strip()
         return None
 
     # ==================================================================
